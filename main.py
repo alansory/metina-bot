@@ -20,7 +20,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # --- GANTI DENGAN CHANNEL & ROLE ID KAMU ---
 AUTO_ROLE_ID = 1437345814245801994  # 🟢 Role default untuk member baru
-WELCOME_CHANNEL_ID = 1425708221175173125  # ID channel welcome
+WELCOME_CHANNEL_ID = 1425708221175173122  # ID channel welcome
 
 # --- EVENT: BOT ONLINE ---
 @bot.event
