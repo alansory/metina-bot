@@ -27,44 +27,107 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # --- GANTI DENGAN CHANNEL & ROLE ID KAMU ---
 ALLOWED_CHANNEL_ID = 1428299549507584080  # Channel LP Calls
 MENTION_ROLE_ID = 1437345814245801994  # Role yg mau di-mention di thread
-AUTO_ROLE_ID = 1437345814245801994  # 🟢 Role default untuk member baru
+AUTO_ROLE_ID = 1437345814245801994  # 🟢 Role default untuk member baru (setelah verifikasi)
+UNVERIFIED_ROLE_ID = 1437655801354522684  # Role unverified untuk member baru
+VERIFY_CHANNEL_ID = 1437656297276444682  # Channel verify-here
 WELCOME_CHANNEL_ID = 1425708221175173122  # ID channel welcome
+
+# --- HELPER: SETUP VERIFY MESSAGE ---
+async def setup_verify_message():
+    """Setup pesan verifikasi di channel verify-here"""
+    try:
+        verify_channel = bot.get_channel(VERIFY_CHANNEL_ID)
+        if not verify_channel:
+            print(f"⚠️ Channel verify-here dengan ID {VERIFY_CHANNEL_ID} tidak ditemukan")
+            return
+        
+        # Cek apakah sudah ada pesan verifikasi dari bot
+        async for message in verify_channel.history(limit=50):
+            if message.author == bot.user and message.embeds:
+                # Cek apakah ini pesan verifikasi (biasanya ada embed dengan title tertentu)
+                if message.embeds and len(message.embeds) > 0:
+                    embed_title = message.embeds[0].title or ""
+                    if "verifikasi" in embed_title.lower() or "verify" in embed_title.lower():
+                        print(f"[DEBUG] Pesan verifikasi sudah ada di channel verify-here (Message ID: {message.id})")
+                        # Pastikan reaction masih ada
+                        if not message.reactions:
+                            await message.add_reaction("✅")
+                            print(f"[DEBUG] Reaction ✅ ditambahkan ke pesan verifikasi yang sudah ada")
+                        return
+        
+        # Buat pesan verifikasi baru
+        embed = discord.Embed(
+            title="✅ Verifikasi Member",
+            description=(
+                "**Selamat datang di Metina LP Army!** 🎉\n\n"
+                "Untuk mendapatkan akses penuh ke server, silakan klik reaction **✅** di bawah ini untuk verifikasi.\n\n"
+                "Setelah verifikasi, kamu akan mendapatkan role member dan bisa mengakses semua channel di server.\n\n"
+                "**Cara verifikasi:**\n"
+                "1. Klik emoji ✅ di bawah pesan ini\n"
+                "2. Tunggu beberapa detik\n"
+                "3. Role member akan diberikan otomatis! 🚀"
+            ),
+            color=0x00ff00
+        )
+        embed.set_footer(text="Klik reaction ✅ untuk verifikasi")
+        
+        verify_message = await verify_channel.send(embed=embed)
+        await verify_message.add_reaction("✅")
+        print(f"✅ Pesan verifikasi berhasil dibuat di channel verify-here (Message ID: {verify_message.id})")
+        
+    except discord.Forbidden:
+        print(f"❌ Bot tidak punya izin untuk kirim pesan atau tambah reaction di channel verify-here (ID: {VERIFY_CHANNEL_ID})")
+    except Exception as e:
+        print(f"⚠️ Error saat setup pesan verifikasi: {e}")
+        import traceback
+        traceback.print_exc()
 
 # --- EVENT: BOT ONLINE ---
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} sudah online dan siap digunakan!")
     print(f"[DEBUG] Connected to {len(bot.guilds)} guild(s): {[g.name for g in bot.guilds]}")
+    
+    # Setup pesan verifikasi
+    await setup_verify_message()
 
 # --- EVENT: MEMBER BARU JOIN ---
 @bot.event
 async def on_member_join(member: discord.Member):
     print(f"[DEBUG] New member joined: {member.name}")
 
-    # Tambahkan role otomatis
-    role = member.guild.get_role(AUTO_ROLE_ID)
-    if role:
+    # Tambahkan role unverified otomatis
+    unverified_role = member.guild.get_role(UNVERIFIED_ROLE_ID)
+    if unverified_role:
         try:
-            await member.add_roles(role)
-            print(f"✅ Role {role.name} diberikan ke {member.name}")
+            await member.add_roles(unverified_role)
+            print(f"✅ Role {unverified_role.name} diberikan ke {member.name}")
         except discord.Forbidden:
-            print(f"❌ Bot tidak punya izin untuk menambahkan role")
+            print("❌ Bot tidak punya izin untuk menambahkan role unverified")
         except Exception as e:
-            print(f"⚠️ Error saat memberi role otomatis: {e}")
+            print(f"⚠️ Error saat memberi role unverified: {e}")
     else:
-        print(f"⚠️ Role dengan ID {AUTO_ROLE_ID} tidak ditemukan di server {member.guild.name}")
+        print(f"⚠️ Role dengan ID {UNVERIFIED_ROLE_ID} tidak ditemukan di server {member.guild.name}")
 
     # Kirim pesan sambutan
     if WELCOME_CHANNEL_ID:
         channel = bot.get_channel(WELCOME_CHANNEL_ID)
         if channel:
-            await channel.send(
-                f"👋 Selamat datang {member.mention}! "
-                f"Role **{role.name if role else 'Default'}** sudah diberikan otomatis 🎉\n\n"
-                "Welcome Lpeeps👋 Selamat datang di metina.id komunitas Liquidity Provider di Indonesia 🇮🇩. "
-                "Biar lebih afdol baca #📜｜rules & #👋｜welcome. Lets grow together 🚀"
-            )
-            print(f"[DEBUG] Welcome message sent to {member.name}")
+            try:
+                verify_channel_mention = f"<#{VERIFY_CHANNEL_ID}>" if VERIFY_CHANNEL_ID else "channel verify-here"
+                await channel.send(
+                    f"👋 Selamat datang {member.mention}!\n\n"
+                    "Welcome Lpeeps👋 Selamat datang di metina.id komunitas Liquidity Provider di Indonesia 🇮🇩. "
+                    "Biar lebih afdol baca #📜｜rules & #👋｜welcome. Lets grow together 🚀\n\n"
+                    f"⚠️ **Penting:** Silakan verifikasi diri kamu di {verify_channel_mention} untuk mendapatkan akses penuh ke server! ✅"
+                )
+                print(f"[DEBUG] Welcome message sent to {member.name}")
+            except discord.Forbidden:
+                print(f"❌ Bot tidak punya izin untuk kirim pesan di channel welcome (ID: {WELCOME_CHANNEL_ID})")
+            except discord.HTTPException as e:
+                print(f"⚠️ HTTP error saat kirim welcome message: {e}")
+            except Exception as e:
+                print(f"⚠️ Error saat kirim welcome message: {e}")
         else:
             print(f"⚠️ Channel welcome dengan ID {WELCOME_CHANNEL_ID} tidak ditemukan")
 
@@ -239,6 +302,75 @@ async def on_message(message: discord.Message):
 
     # penting supaya command seperti !call tetap bisa jalan
     await bot.process_commands(message)
+
+# --- EVENT: REACTION ADD (VERIFICATION) ---
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    # Cek apakah reaction di channel verify-here
+    if payload.channel_id != VERIFY_CHANNEL_ID:
+        return
+    
+    # Cek apakah user bukan bot
+    if payload.member and payload.member.bot:
+        return
+    
+    print(f"[DEBUG] Reaction detected in verify channel by {payload.member.name if payload.member else 'Unknown'}")
+    
+    try:
+        guild = bot.get_guild(payload.guild_id)
+        if not guild:
+            print(f"⚠️ Guild dengan ID {payload.guild_id} tidak ditemukan")
+            return
+        
+        member = guild.get_member(payload.user_id)
+        if not member:
+            print(f"⚠️ Member dengan ID {payload.user_id} tidak ditemukan")
+            return
+        
+        # Cek apakah member punya role unverified
+        unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
+        verified_role = guild.get_role(AUTO_ROLE_ID)
+        
+        if not unverified_role:
+            print(f"⚠️ Role unverified dengan ID {UNVERIFIED_ROLE_ID} tidak ditemukan")
+            return
+        
+        if not verified_role:
+            print(f"⚠️ Role verified dengan ID {AUTO_ROLE_ID} tidak ditemukan")
+            return
+        
+        # Cek apakah member punya role unverified
+        if unverified_role not in member.roles:
+            print(f"[DEBUG] Member {member.name} tidak punya role unverified, skip")
+            return
+        
+        # Hapus role unverified dan tambahkan role verified
+        try:
+            await member.remove_roles(unverified_role)
+            await member.add_roles(verified_role)
+            print(f"✅ {member.name} berhasil diverifikasi! Role {unverified_role.name} dihapus, role {verified_role.name} ditambahkan")
+            
+            # Kirim DM konfirmasi (optional)
+            try:
+                await member.send(
+                    f"✅ **Verifikasi Berhasil!**\n\n"
+                    f"Selamat {member.mention}! Kamu sudah berhasil diverifikasi di **{guild.name}**.\n"
+                    f"Role **{verified_role.name}** sudah diberikan. Selamat bergabung! 🎉"
+                )
+            except discord.Forbidden:
+                # User mungkin menutup DM, tidak masalah
+                print(f"[DEBUG] Tidak bisa kirim DM ke {member.name} (DM mungkin ditutup)")
+        except discord.Forbidden:
+            print(f"❌ Bot tidak punya izin untuk mengubah role member {member.name}")
+        except Exception as e:
+            print(f"⚠️ Error saat memverifikasi member {member.name}: {e}")
+            import traceback
+            traceback.print_exc()
+            
+    except Exception as e:
+        print(f"[ERROR] Unexpected error in on_raw_reaction_add: {e}")
+        import traceback
+        traceback.print_exc()
 
 # --- COMMAND: !call <contract_address> ---
 @bot.command(name="call")
