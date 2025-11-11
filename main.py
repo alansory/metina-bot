@@ -32,6 +32,12 @@ UNVERIFIED_ROLE_ID = 1437655801354522684  # Role unverified untuk member baru
 VERIFY_CHANNEL_ID = 1437656297276444682  # Channel verify-here
 WELCOME_CHANNEL_ID = 1425708221175173122  # ID channel welcome
 
+# --- FITUR BARU: TRACK WALLET ---
+FEATURE_CHANNEL_ID = 1437710602301739053  # Channel untuk setup fitur (ganti dengan ID channel fitur kamu, misalnya #setup-fitur)
+TRACK_WALLET_EMOJI = "💼"  # Emoji untuk react track wallet
+TRACK_WALLET_ROLE_ID = 1437711623178686546  # Role untuk akses track wallet (buat role baru di server)
+TRACK_WALLET_CHANNEL_ID = 1437712394200809482  # Channel private untuk track wallet (set private, hanya visible untuk role ini)
+
 # --- HELPER: SETUP VERIFY MESSAGE ---
 async def setup_verify_message():
     """Setup pesan verifikasi di channel verify-here"""
@@ -82,6 +88,59 @@ async def setup_verify_message():
         import traceback
         traceback.print_exc()
 
+# --- HELPER: SETUP FEATURE MESSAGE ---
+async def setup_feature_message():
+    """Setup pesan setup fitur di channel fitur (multiple reactions untuk berbagai fitur)"""
+    try:
+        feature_channel = bot.get_channel(FEATURE_CHANNEL_ID)
+        if not feature_channel:
+            print(f"⚠️ Channel fitur dengan ID {FEATURE_CHANNEL_ID} tidak ditemukan")
+            return
+        
+        # Cek apakah sudah ada pesan fitur dari bot
+        async for message in feature_channel.history(limit=50):
+            if message.author == bot.user and message.embeds:
+                # Cek apakah ini pesan fitur (title mengandung "fitur")
+                if message.embeds and len(message.embeds) > 0:
+                    embed_title = message.embeds[0].title or ""
+                    if "fitur" in embed_title.lower():
+                        print(f"[DEBUG] Pesan fitur sudah ada di channel fitur (Message ID: {message.id})")
+                        # Pastikan reactions masih ada
+                        reactions_to_add = [TRACK_WALLET_EMOJI]  # Tambah reactions yang diperlukan
+                        for emoji in reactions_to_add:
+                            if not any(r.emoji == emoji for r in message.reactions):
+                                await message.add_reaction(emoji)
+                                print(f"[DEBUG] Reaction {emoji} ditambahkan ke pesan fitur yang sudah ada")
+                        return
+        
+        # Buat pesan fitur baru
+        embed = discord.Embed(
+            title="⚙️ Setup Fitur Tambahan",
+            description=(
+                "**Pilih fitur yang ingin kamu aktifkan dengan klik reaction di bawah!** 🔧\n\n"
+                "**Fitur Tersedia:**\n"
+                "• 💼 **Track Wallet**: Aktifkan tracking wallet. Setelah aktif, channel #tracker akan terbuka dan role diberikan.\n\n"
+                "(Fitur lain bisa ditambah di sini nanti)\n\n"
+                "**Cara setup:**\n"
+                "1. Klik emoji fitur yang diinginkan\n"
+                "2. Tunggu konfirmasi\n"
+                "3. Channel & role akan otomatis diakses! 🚀"
+            ),
+            color=0x9b59b6
+        )
+        embed.set_footer(text="Klik reaction untuk aktifkan fitur")
+        
+        feature_message = await feature_channel.send(embed=embed)
+        await feature_message.add_reaction(TRACK_WALLET_EMOJI)
+        print(f"✅ Pesan fitur berhasil dibuat di channel fitur (Message ID: {feature_message.id})")
+        
+    except discord.Forbidden:
+        print(f"❌ Bot tidak punya izin untuk kirim pesan atau tambah reaction di channel fitur (ID: {FEATURE_CHANNEL_ID})")
+    except Exception as e:
+        print(f"⚠️ Error saat setup pesan fitur: {e}")
+        import traceback
+        traceback.print_exc()
+
 # --- EVENT: BOT ONLINE ---
 @bot.event
 async def on_ready():
@@ -90,6 +149,9 @@ async def on_ready():
     
     # Setup pesan verifikasi
     await setup_verify_message()
+    
+    # Setup pesan fitur (BARU)
+    await setup_feature_message()
 
 # --- EVENT: MEMBER BARU JOIN ---
 @bot.event
@@ -115,11 +177,13 @@ async def on_member_join(member: discord.Member):
         if channel:
             try:
                 verify_channel_mention = f"<#{VERIFY_CHANNEL_ID}>" if VERIFY_CHANNEL_ID else "channel verify-here"
+                feature_channel_mention = f"<#{FEATURE_CHANNEL_ID}>"
                 await channel.send(
                     f"👋 Selamat datang {member.mention}!\n\n"
                     "Welcome Lpeeps👋 Selamat datang di metina.id komunitas Liquidity Provider di Indonesia 🇮🇩. "
                     "Biar lebih afdol baca #📜｜rules & #👋｜welcome. Lets grow together 🚀\n\n"
-                    f"⚠️ **Penting:** Silakan verifikasi diri kamu di {verify_channel_mention} untuk mendapatkan akses penuh ke server! ✅"
+                    f"⚠️ **Penting:** Silakan verifikasi diri kamu di {verify_channel_mention} untuk mendapatkan akses penuh ke server! ✅\n\n"
+                    f"💡 **Fitur Tambahan:** Cek {feature_channel_mention} untuk aktifkan fitur seperti Track Wallet! 💼"
                 )
                 print(f"[DEBUG] Welcome message sent to {member.name}")
             except discord.Forbidden:
@@ -133,6 +197,10 @@ async def on_member_join(member: discord.Member):
 
 # --- HELPER: CEK VALID SOLANA ADDRESS ---
 def is_valid_solana_address(addr: str):
+    return bool(re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{32,44}', addr))
+
+# --- HELPER: CEK VALID SOLANA WALLET ADDRESS ---
+def is_valid_solana_wallet(addr: str):
     return bool(re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{32,44}', addr))
 
 # --- HELPER: FETCH POOL DATA ---
@@ -240,137 +308,224 @@ async def on_message(message: discord.Message):
 
     content = message.content.strip()
     if is_valid_solana_address(content):
-        print(f"[DEBUG] Valid Solana address detected: {content}")
-        try:
-            await message.channel.send(f"🔍 Cek pool DLMM untuk token: `{content[:8]}...`")
-        except Exception as e:
-            print(f"[ERROR] Gagal kirim initial message: {e}")
-            return
-
-        try:
-            print(f"[DEBUG] Starting to fetch pools for {content}")
-            sys.stdout.flush()
-            pools = fetch_meteora_pools(content)
-            print(f"[DEBUG] Fetch completed, found {len(pools)} pools")
-            sys.stdout.flush()
-            
-            if not pools:
+        # Cek apakah ini di channel tracker wallet
+        if message.channel.id == TRACK_WALLET_CHANNEL_ID:
+            # Handle sebagai wallet tracking
+            try:
                 embed = discord.Embed(
-                    title="Pool DLMM Meteora",
-                    description=f"Gak ditemuin pool untuk token `{content[:8]}...`",
-                    color=0xff0000)
-                await message.channel.send(embed=embed)
+                    title="💼 Wallet Tracking",
+                    description=f"🔍 Mulai tracking wallet: `{content[:8]}...`\n\n**Status:** Aktif! Bot akan monitor transaksi Solana kamu.\n\n*(Fitur tracking detail akan diimplementasikan nanti - sementara ini konfirmasi saja)*",
+                    color=0x00ff00
+                )
+                embed.set_footer(text=f"Wallet: {content}")
+                await message.reply(embed=embed)
+                print(f"[DEBUG] Wallet tracking started for {message.author}: {content}")
+            except Exception as e:
+                print(f"[ERROR] Error handling wallet track: {e}")
+        else:
+            # Handle sebagai token pool check (kode lama)
+            print(f"[DEBUG] Valid Solana address detected: {content}")
+            try:
+                await message.channel.send(f"🔍 Cek pool DLMM untuk token: `{content[:8]}...`")
+            except Exception as e:
+                print(f"[ERROR] Gagal kirim initial message: {e}")
                 return
 
-            print(f"[DEBUG] Sorting pools by liquidity...")
-            pools.sort(key=lambda x: x['raw_liq'], reverse=True)
-            print(f"[DEBUG] Building embed description...")
-            desc = f"Found {len(pools)} pool untuk `{content}`\n\n"
-
-            for i, p in enumerate(pools[:10], 1):
-                link = f"https://app.meteora.ag/dlmm/{p['address']}"
-                desc += f"{i}. [{p['pair']}]({link}) {p['bin']} - LQ: {p['liq']}\n"
-
-            print(f"[DEBUG] Creating embed object...")
-            embed = discord.Embed(title="Meteora Pool Bot", description=desc, color=0x00ff00)
-            embed.set_footer(text=f"Requested by {message.author.display_name}")
-            print(f"[DEBUG] Sending embed with {len(pools[:10])} pools to channel {message.channel.id}")
-            sys.stdout.flush()
             try:
-                await message.channel.send(embed=embed)
-                print(f"[DEBUG] ✅ Embed sent successfully!")
+                print(f"[DEBUG] Starting to fetch pools for {content}")
                 sys.stdout.flush()
-            except discord.Forbidden:
-                print(f"[ERROR] Bot tidak punya permission untuk kirim pesan di channel ini")
-                raise
-            except discord.HTTPException as e:
-                print(f"[ERROR] Discord HTTP error saat kirim embed: {e}")
-                raise
-        except requests.exceptions.Timeout:
-            print("[ERROR] Request timeout")
-            await message.channel.send("❌ **Timeout**: API tidak merespons dalam 30 detik. Coba lagi nanti.")
-        except requests.exceptions.RequestException as e:
-            print(f"[ERROR] Request error: {e}")
-            import traceback
-            traceback.print_exc()
-            await message.channel.send(f"❌ **Connection Error**: Tidak bisa connect ke API Meteora. Error: {str(e)}")
-        except Exception as e:
-            print(f"[ERROR] Unexpected error: {e}")
-            import traceback
-            traceback.print_exc()
-            await message.channel.send(f"❌ **Error**: {str(e)}")
+                pools = fetch_meteora_pools(content)
+                print(f"[DEBUG] Fetch completed, found {len(pools)} pools")
+                sys.stdout.flush()
+                
+                if not pools:
+                    embed = discord.Embed(
+                        title="Pool DLMM Meteora",
+                        description=f"Gak ditemuin pool untuk token `{content[:8]}...`",
+                        color=0xff0000)
+                    await message.channel.send(embed=embed)
+                    return
+
+                print(f"[DEBUG] Sorting pools by liquidity...")
+                pools.sort(key=lambda x: x['raw_liq'], reverse=True)
+                print(f"[DEBUG] Building embed description...")
+                desc = f"Found {len(pools)} pool untuk `{content}`\n\n"
+
+                for i, p in enumerate(pools[:10], 1):
+                    link = f"https://app.meteora.ag/dlmm/{p['address']}"
+                    desc += f"{i}. [{p['pair']}]({link}) {p['bin']} - LQ: {p['liq']}\n"
+
+                print(f"[DEBUG] Creating embed object...")
+                embed = discord.Embed(title="Meteora Pool Bot", description=desc, color=0x00ff00)
+                embed.set_footer(text=f"Requested by {message.author.display_name}")
+                print(f"[DEBUG] Sending embed with {len(pools[:10])} pools to channel {message.channel.id}")
+                sys.stdout.flush()
+                try:
+                    await message.channel.send(embed=embed)
+                    print(f"[DEBUG] ✅ Embed sent successfully!")
+                    sys.stdout.flush()
+                except discord.Forbidden:
+                    print(f"[ERROR] Bot tidak punya permission untuk kirim pesan di channel ini")
+                    raise
+                except discord.HTTPException as e:
+                    print(f"[ERROR] Discord HTTP error saat kirim embed: {e}")
+                    raise
+            except requests.exceptions.Timeout:
+                print("[ERROR] Request timeout")
+                await message.channel.send("❌ **Timeout**: API tidak merespons dalam 30 detik. Coba lagi nanti.")
+            except requests.exceptions.RequestException as e:
+                print(f"[ERROR] Request error: {e}")
+                import traceback
+                traceback.print_exc()
+                await message.channel.send(f"❌ **Connection Error**: Tidak bisa connect ke API Meteora. Error: {str(e)}")
+            except Exception as e:
+                print(f"[ERROR] Unexpected error: {e}")
+                import traceback
+                traceback.print_exc()
+                await message.channel.send(f"❌ **Error**: {str(e)}")
 
     # penting supaya command seperti !call tetap bisa jalan
     await bot.process_commands(message)
 
-# --- EVENT: REACTION ADD (VERIFICATION) ---
+# --- EVENT: REACTION ADD (VERIFICATION & FITUR) ---
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # Cek apakah reaction di channel verify-here
-    if payload.channel_id != VERIFY_CHANNEL_ID:
-        return
-    
-    # Cek apakah user bukan bot
-    if payload.member and payload.member.bot:
-        return
-    
-    print(f"[DEBUG] Reaction detected in verify channel by {payload.member.name if payload.member else 'Unknown'}")
-    
-    try:
-        guild = bot.get_guild(payload.guild_id)
-        if not guild:
-            print(f"⚠️ Guild dengan ID {payload.guild_id} tidak ditemukan")
+    if payload.channel_id == VERIFY_CHANNEL_ID:
+        # Handle verifikasi (kode lama)
+        if str(payload.emoji) != "✅":
             return
         
-        member = guild.get_member(payload.user_id)
-        if not member:
-            print(f"⚠️ Member dengan ID {payload.user_id} tidak ditemukan")
+        # Cek apakah user bukan bot
+        if payload.member and payload.member.bot:
             return
         
-        # Cek apakah member punya role unverified
-        unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
-        verified_role = guild.get_role(AUTO_ROLE_ID)
+        print(f"[DEBUG] Reaction ✅ detected in verify channel by {payload.member.name if payload.member else 'Unknown'}")
         
-        if not unverified_role:
-            print(f"⚠️ Role unverified dengan ID {UNVERIFIED_ROLE_ID} tidak ditemukan")
-            return
-        
-        if not verified_role:
-            print(f"⚠️ Role verified dengan ID {AUTO_ROLE_ID} tidak ditemukan")
-            return
-        
-        # Cek apakah member punya role unverified
-        if unverified_role not in member.roles:
-            print(f"[DEBUG] Member {member.name} tidak punya role unverified, skip")
-            return
-        
-        # Hapus role unverified dan tambahkan role verified
         try:
-            await member.remove_roles(unverified_role)
-            await member.add_roles(verified_role)
-            print(f"✅ {member.name} berhasil diverifikasi! Role {unverified_role.name} dihapus, role {verified_role.name} ditambahkan")
+            guild = bot.get_guild(payload.guild_id)
+            if not guild:
+                print(f"⚠️ Guild dengan ID {payload.guild_id} tidak ditemukan")
+                return
             
-            # Kirim DM konfirmasi (optional)
+            member = guild.get_member(payload.user_id)
+            if not member:
+                print(f"⚠️ Member dengan ID {payload.user_id} tidak ditemukan")
+                return
+            
+            # Cek apakah member punya role unverified
+            unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
+            verified_role = guild.get_role(AUTO_ROLE_ID)
+            
+            if not unverified_role:
+                print(f"⚠️ Role unverified dengan ID {UNVERIFIED_ROLE_ID} tidak ditemukan")
+                return
+            
+            if not verified_role:
+                print(f"⚠️ Role verified dengan ID {AUTO_ROLE_ID} tidak ditemukan")
+                return
+            
+            # Cek apakah member punya role unverified
+            if unverified_role not in member.roles:
+                print(f"[DEBUG] Member {member.name} tidak punya role unverified, skip")
+                return
+            
+            # Hapus role unverified dan tambahkan role verified
             try:
-                await member.send(
-                    f"✅ **Verifikasi Berhasil!**\n\n"
-                    f"Selamat {member.mention}! Kamu sudah berhasil diverifikasi di **{guild.name}**.\n"
-                    f"Role **{verified_role.name}** sudah diberikan. Selamat bergabung! 🎉"
-                )
+                await member.remove_roles(unverified_role)
+                await member.add_roles(verified_role)
+                print(f"✅ {member.name} berhasil diverifikasi! Role {unverified_role.name} dihapus, role {verified_role.name} ditambahkan")
+                
+                # Kirim DM konfirmasi (optional)
+                try:
+                    await member.send(
+                        f"✅ **Verifikasi Berhasil!**\n\n"
+                        f"Selamat {member.mention}! Kamu sudah berhasil diverifikasi di **{guild.name}**.\n"
+                        f"Role **{verified_role.name}** sudah diberikan. Selamat bergabung! 🎉"
+                    )
+                except discord.Forbidden:
+                    # User mungkin menutup DM, tidak masalah
+                    print(f"[DEBUG] Tidak bisa kirim DM ke {member.name} (DM mungkin ditutup)")
             except discord.Forbidden:
-                # User mungkin menutup DM, tidak masalah
-                print(f"[DEBUG] Tidak bisa kirim DM ke {member.name} (DM mungkin ditutup)")
-        except discord.Forbidden:
-            print(f"❌ Bot tidak punya izin untuk mengubah role member {member.name}")
+                print(f"❌ Bot tidak punya izin untuk mengubah role member {member.name}")
+            except Exception as e:
+                print(f"⚠️ Error saat memverifikasi member {member.name}: {e}")
+                import traceback
+                traceback.print_exc()
+                
         except Exception as e:
-            print(f"⚠️ Error saat memverifikasi member {member.name}: {e}")
+            print(f"[ERROR] Unexpected error in on_raw_reaction_add (verify): {e}")
             import traceback
             traceback.print_exc()
+    
+    # BARU: Handle reaction di channel fitur
+    elif payload.channel_id == FEATURE_CHANNEL_ID:
+        if str(payload.emoji) != TRACK_WALLET_EMOJI:
+            return  # Hanya handle emoji track wallet untuk sekarang
+        
+        # Cek apakah user bukan bot
+        if payload.member and payload.member.bot:
+            return
+        
+        print(f"[DEBUG] Reaction {TRACK_WALLET_EMOJI} detected in feature channel by {payload.member.name if payload.member else 'Unknown'}")
+        
+        try:
+            guild = bot.get_guild(payload.guild_id)
+            if not guild:
+                print(f"⚠️ Guild dengan ID {payload.guild_id} tidak ditemukan")
+                return
             
-    except Exception as e:
-        print(f"[ERROR] Unexpected error in on_raw_reaction_add: {e}")
-        import traceback
-        traceback.print_exc()
+            member = guild.get_member(payload.user_id)
+            if not member:
+                print(f"⚠️ Member dengan ID {payload.user_id} tidak ditemukan")
+                return
+            
+            # Cek apakah member sudah punya role track wallet (hindari duplikat)
+            track_wallet_role = guild.get_role(TRACK_WALLET_ROLE_ID)
+            if not track_wallet_role:
+                print(f"⚠️ Role track wallet dengan ID {TRACK_WALLET_ROLE_ID} tidak ditemukan")
+                return
+            
+            if track_wallet_role in member.roles:
+                print(f"[DEBUG] Member {member.name} sudah punya role track wallet, skip")
+                return
+            
+            # Tambahkan role track wallet
+            try:
+                await member.add_roles(track_wallet_role)
+                print(f"✅ {member.name} berhasil mengaktifkan fitur Track Wallet! Role {track_wallet_role.name} ditambahkan")
+                
+                # Kirim pesan konfirmasi ke channel fitur atau DM
+                track_channel = bot.get_channel(TRACK_WALLET_CHANNEL_ID)
+                confirm_msg = (
+                    f"💼 **Fitur Track Wallet Diaktifkan!**\n\n"
+                    f"Selamat {member.mention}! Kamu sekarang bisa akses **{track_channel.mention if track_channel else '#track-wallet'}**.\n"
+                    f"Paste wallet Solana address kamu di sana untuk mulai tracking. (Fitur track akan diimplementasikan nanti)\n\n"
+                    f"**Cara gunakan:**\n"
+                    "1. Masuk ke channel track wallet\n"
+                    "2. Ketik wallet address (akan auto-detect nanti)\n"
+                    "3. Bot akan track transaksi & update! 📊"
+                )
+                
+                try:
+                    await member.send(confirm_msg)
+                    print(f"[DEBUG] DM konfirmasi fitur dikirim ke {member.name}")
+                except discord.Forbidden:
+                    # Jika DM gagal, kirim ke channel fitur
+                    await guild.get_channel(FEATURE_CHANNEL_ID).send(f"{member.mention} {confirm_msg.replace(member.mention, '')}")
+                    print(f"[DEBUG] DM gagal, konfirmasi dikirim ke channel fitur untuk {member.name}")
+                    
+            except discord.Forbidden:
+                print(f"❌ Bot tidak punya izin untuk mengubah role member {member.name}")
+            except Exception as e:
+                print(f"⚠️ Error saat mengaktifkan fitur untuk member {member.name}: {e}")
+                import traceback
+                traceback.print_exc()
+                
+        except Exception as e:
+            print(f"[ERROR] Unexpected error in on_raw_reaction_add (feature): {e}")
+            import traceback
+            traceback.print_exc()
 
 # --- COMMAND: !call <contract_address> ---
 @bot.command(name="call")
