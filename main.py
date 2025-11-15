@@ -259,8 +259,9 @@ async def fetch_token_metadata(mint: str) -> Dict[str, Optional[object]]:
     return metadata
 
 # --- HELPER: FETCH RECENT SWAPS FROM HELIUS ---
-async def fetch_recent_swaps(wallet: str) -> List[Dict]:
-    """Fetch most recent SWAP transactions (newest-first) without paginating backwards."""
+async def fetch_recent_swaps(wallet: str, max_retries: int = 3) -> List[Dict]:
+    """Fetch most recent SWAP transactions (newest-first) without paginating backwards.
+    Implements exponential backoff for rate limiting (429 errors)."""
     if not HELIUS_API_KEY:
         return []
     
@@ -275,14 +276,44 @@ async def fetch_recent_swaps(wallet: str) -> List[Dict]:
         'limit': 5,  # cek transaksi terbaru saja
     }
     
-    try:
-        async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
-            response.raise_for_status()
-            data = await response.json()
-            return data
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch swaps for {wallet}: {e}")
-        return []
+    for attempt in range(max_retries):
+        try:
+            async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                # Handle rate limiting (429) with exponential backoff
+                if response.status == 429:
+                    retry_after = int(response.headers.get('Retry-After', 60))  # Default 60 seconds
+                    wait_time = min(retry_after, 120)  # Cap at 2 minutes
+                    
+                    if attempt < max_retries - 1:
+                        print(f"[WARN] Rate limited (429) for {wallet[:8]}... - waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"[ERROR] Rate limited (429) for {wallet[:8]}... - max retries reached, skipping")
+                        return []
+                
+                response.raise_for_status()
+                data = await response.json()
+                return data
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429:
+                # If we get here, it means we already handled it above, but just in case
+                if attempt < max_retries - 1:
+                    wait_time = 60 * (2 ** attempt)  # Exponential backoff: 60s, 120s, 240s
+                    print(f"[WARN] Rate limited (429) for {wallet[:8]}... - waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    print(f"[ERROR] Rate limited (429) for {wallet[:8]}... - max retries reached, skipping")
+                    return []
+            else:
+                print(f"[ERROR] HTTP {e.status} error fetching swaps for {wallet[:8]}...: {e}")
+                return []
+        except Exception as e:
+            print(f"[ERROR] Failed to fetch swaps for {wallet[:8]}...: {e}")
+            return []
+    
+    return []
 
 # --- HELPER: DETECT BUY TRANSACTION ---
 def is_buy_transaction(tx: Dict, wallet: str) -> bool:
@@ -493,11 +524,18 @@ async def send_buy_notification_global(wallet_data: Dict):
     save_default_wallets()
 
 # --- BACKGROUND TASK: POLL FOR BUYS ---
-@tasks.loop(minutes=1)  # Poll every 1 minute
+@tasks.loop(minutes=2)  # Poll every 2 minutes (reduced frequency to avoid rate limits)
 async def poll_wallet_buys():
     if not HELIUS_API_KEY:
         print("[DEBUG] Skipping poll - No Helius API key")
         return
+    
+    # Count total wallets to track progress
+    total_wallets = sum(len(wallets) for wallets in tracked_wallets.values()) + len(default_tracked_wallets)
+    if total_wallets == 0:
+        return
+    
+    print(f"[DEBUG] Polling {total_wallets} wallet(s) for buy transactions...")
     
     # Poll user wallets
     for user_id_str, wallets_data in tracked_wallets.items():
@@ -506,24 +544,31 @@ async def poll_wallet_buys():
             for wallet, wallet_data in wallets_data.items():
                 try:
                     await send_buy_notification(user, {'wallet': wallet, 'alias': wallet_data['alias'], 'last_sig': wallet_data['last_sig']})
-                    # Small delay to prevent overwhelming the API
-                    await asyncio.sleep(0.5)
+                    # Increased delay to respect rate limits (2 seconds between requests)
+                    await asyncio.sleep(2)
                 except Exception as e:
                     print(f"[ERROR] Poll error for wallet {wallet[:8]}... of user {user_id_str}: {e}")
+                    # Still wait even on error to avoid rapid-fire retries
+                    await asyncio.sleep(1)
                     continue
         except Exception as e:
             print(f"[ERROR] Poll error for user {user_id_str}: {e}")
+            await asyncio.sleep(1)
             continue
     
     # Poll global default wallets (role-wide)
     for item in default_tracked_wallets:
         try:
             await send_buy_notification_global(item)
-            # Small delay to prevent overwhelming the API
-            await asyncio.sleep(0.5)
+            # Increased delay to respect rate limits (2 seconds between requests)
+            await asyncio.sleep(2)
         except Exception as e:
             print(f"[ERROR] Poll error for default wallet {item.get('wallet', 'unknown')[:8]}...: {e}")
+            # Still wait even on error to avoid rapid-fire retries
+            await asyncio.sleep(1)
             continue
+    
+    print(f"[DEBUG] Completed polling cycle for {total_wallets} wallet(s)")
 
 # --- HELPER: SETUP VERIFY MESSAGE ---
 async def setup_verify_message():
