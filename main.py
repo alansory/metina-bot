@@ -8,6 +8,8 @@ import re
 import sys
 import json
 import time
+import random
+from collections import deque
 from discord import app_commands
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -37,6 +39,71 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # --- AIOHTTP SESSION FOR ASYNC HTTP REQUESTS ---
 http_session: Optional[aiohttp.ClientSession] = None
+
+# --- RATE LIMITING & CIRCUIT BREAKER ---
+# Rate limiter: max 8 requests per minute (Helius free tier biasanya 100/min, kita konservatif)
+RATE_LIMIT_REQUESTS = 8  # Max requests per window
+RATE_LIMIT_WINDOW = 60  # 60 seconds window
+request_timestamps = deque()  # Track request timestamps
+circuit_breaker_active = False
+circuit_breaker_until = 0  # Timestamp when circuit breaker resets
+MIN_DELAY_BETWEEN_REQUESTS = 8  # Minimum 8 seconds between requests (conservative)
+MAX_DELAY_BETWEEN_REQUESTS = 12  # Max 12 seconds (with jitter)
+
+# --- METEORA API RATE LIMITING ---
+# Rate limiter untuk Meteora API (synchronous)
+meteora_last_request_time = 0  # Timestamp of last Meteora API request
+METEORA_MIN_DELAY = 3  # Minimum 3 seconds between Meteora requests
+meteora_circuit_breaker_active = False
+meteora_circuit_breaker_until = 0
+
+async def wait_for_rate_limit():
+    """Wait if we're hitting rate limits, implements token bucket pattern."""
+    global circuit_breaker_active, circuit_breaker_until, request_timestamps
+    
+    now = time.time()
+    
+    # Check circuit breaker
+    if circuit_breaker_active:
+        if now < circuit_breaker_until:
+            wait_time = circuit_breaker_until - now
+            print(f"[RATE_LIMIT] Circuit breaker active, waiting {wait_time:.1f}s...")
+            await asyncio.sleep(wait_time)
+            circuit_breaker_active = False
+        else:
+            circuit_breaker_active = False
+    
+    # Clean old timestamps outside window
+    while request_timestamps and now - request_timestamps[0] > RATE_LIMIT_WINDOW:
+        request_timestamps.popleft()
+    
+    # If we're at the limit, wait until oldest request expires
+    if len(request_timestamps) >= RATE_LIMIT_REQUESTS:
+        oldest = request_timestamps[0]
+        wait_time = RATE_LIMIT_WINDOW - (now - oldest) + 1  # +1 for safety
+        print(f"[RATE_LIMIT] Rate limit reached ({len(request_timestamps)}/{RATE_LIMIT_REQUESTS}), waiting {wait_time:.1f}s...")
+        await asyncio.sleep(wait_time)
+        # Clean again after waiting
+        now = time.time()
+        while request_timestamps and now - request_timestamps[0] > RATE_LIMIT_WINDOW:
+            request_timestamps.popleft()
+    
+    # Add jitter to avoid thundering herd
+    jitter = random.uniform(0, 2)  # 0-2 seconds random delay
+    base_delay = random.uniform(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS)
+    delay = base_delay + jitter
+    
+    await asyncio.sleep(delay)
+    
+    # Record this request
+    request_timestamps.append(time.time())
+
+def activate_circuit_breaker(duration: int = 300):
+    """Activate circuit breaker for specified duration (default 5 minutes)."""
+    global circuit_breaker_active, circuit_breaker_until
+    circuit_breaker_active = True
+    circuit_breaker_until = time.time() + duration
+    print(f"[CIRCUIT_BREAKER] Activated for {duration}s due to rate limiting")
 
 # --- GANTI DENGAN CHANNEL & ROLE ID KAMU ---
 ALLOWED_CHANNEL_ID = 1428299549507584080  # Channel LP Calls
@@ -259,12 +326,22 @@ async def fetch_token_metadata(mint: str) -> Dict[str, Optional[object]]:
     return metadata
 
 # --- HELPER: FETCH RECENT SWAPS FROM HELIUS ---
-async def fetch_recent_swaps(wallet: str) -> List[Dict]:
-    """Fetch most recent SWAP transactions (newest-first) without paginating backwards."""
+async def fetch_recent_swaps(wallet: str, max_retries: int = 2) -> List[Dict]:
+    """Fetch most recent SWAP transactions (newest-first) without paginating backwards.
+    Implements exponential backoff for rate limiting (429 errors) with global rate limiter."""
     if not HELIUS_API_KEY:
         return []
     
-    global http_session
+    global http_session, circuit_breaker_active, circuit_breaker_until
+    
+    # Check circuit breaker first
+    if circuit_breaker_active and time.time() < circuit_breaker_until:
+        print(f"[SKIP] Circuit breaker active, skipping wallet {wallet[:8]}...")
+        return []
+    
+    # Wait for rate limit before making request
+    await wait_for_rate_limit()
+    
     if not http_session:
         http_session = aiohttp.ClientSession()
     
@@ -275,14 +352,67 @@ async def fetch_recent_swaps(wallet: str) -> List[Dict]:
         'limit': 5,  # cek transaksi terbaru saja
     }
     
-    try:
-        async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
-            response.raise_for_status()
-            data = await response.json()
-            return data
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch swaps for {wallet}: {e}")
-        return []
+    consecutive_429s = 0
+    
+    for attempt in range(max_retries):
+        try:
+            async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                # Handle rate limiting (429) with exponential backoff
+                if response.status == 429:
+                    consecutive_429s += 1
+                    retry_after = int(response.headers.get('Retry-After', 120))  # Default 2 minutes
+                    wait_time = min(retry_after, 300)  # Cap at 5 minutes
+                    
+                    # If multiple 429s, activate circuit breaker
+                    if consecutive_429s >= 2:
+                        activate_circuit_breaker(duration=600)  # 10 minutes
+                        print(f"[ERROR] Multiple 429 errors, circuit breaker activated for 10 minutes")
+                        return []
+                    
+                    if attempt < max_retries - 1:
+                        print(f"[WARN] Rate limited (429) for {wallet[:8]}... - waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        await asyncio.sleep(wait_time)
+                        # Wait again for rate limit after backoff
+                        await wait_for_rate_limit()
+                        continue
+                    else:
+                        print(f"[ERROR] Rate limited (429) for {wallet[:8]}... - max retries reached, activating circuit breaker")
+                        activate_circuit_breaker(duration=300)  # 5 minutes
+                        return []
+                
+                # Reset consecutive 429s on success
+                consecutive_429s = 0
+                response.raise_for_status()
+                data = await response.json()
+                return data
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429:
+                consecutive_429s += 1
+                # If multiple 429s, activate circuit breaker
+                if consecutive_429s >= 2:
+                    activate_circuit_breaker(duration=600)  # 10 minutes
+                    print(f"[ERROR] Multiple 429 errors, circuit breaker activated for 10 minutes")
+                    return []
+                
+                if attempt < max_retries - 1:
+                    wait_time = 120 * (2 ** attempt)  # Exponential backoff: 120s, 240s
+                    wait_time = min(wait_time, 300)  # Cap at 5 minutes
+                    print(f"[WARN] Rate limited (429) for {wallet[:8]}... - waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    await asyncio.sleep(wait_time)
+                    await wait_for_rate_limit()
+                    continue
+                else:
+                    print(f"[ERROR] Rate limited (429) for {wallet[:8]}... - max retries reached, activating circuit breaker")
+                    activate_circuit_breaker(duration=300)  # 5 minutes
+                    return []
+            else:
+                print(f"[ERROR] HTTP {e.status} error fetching swaps for {wallet[:8]}...: {e}")
+                return []
+        except Exception as e:
+            print(f"[ERROR] Failed to fetch swaps for {wallet[:8]}...: {e}")
+            return []
+    
+    return []
 
 # --- HELPER: DETECT BUY TRANSACTION ---
 def is_buy_transaction(tx: Dict, wallet: str) -> bool:
@@ -493,37 +623,82 @@ async def send_buy_notification_global(wallet_data: Dict):
     save_default_wallets()
 
 # --- BACKGROUND TASK: POLL FOR BUYS ---
-@tasks.loop(minutes=1)  # Poll every 1 minute
+@tasks.loop(minutes=5)  # Poll every 5 minutes (increased to reduce rate limit issues)
 async def poll_wallet_buys():
     if not HELIUS_API_KEY:
         print("[DEBUG] Skipping poll - No Helius API key")
         return
     
+    global circuit_breaker_active, circuit_breaker_until
+    
+    # Check circuit breaker - skip entire cycle if active
+    if circuit_breaker_active and time.time() < circuit_breaker_until:
+        remaining = circuit_breaker_until - time.time()
+        print(f"[SKIP] Polling skipped - Circuit breaker active for {remaining:.0f}s more")
+        return
+    
+    # Count total wallets to track progress
+    total_wallets = sum(len(wallets) for wallets in tracked_wallets.values()) + len(default_tracked_wallets)
+    if total_wallets == 0:
+        return
+    
+    print(f"[DEBUG] Polling {total_wallets} wallet(s) for buy transactions...")
+    
+    processed = 0
+    skipped = 0
+    
     # Poll user wallets
     for user_id_str, wallets_data in tracked_wallets.items():
+        # Check circuit breaker before each user
+        if circuit_breaker_active and time.time() < circuit_breaker_until:
+            print(f"[SKIP] Stopping polling due to circuit breaker")
+            break
+            
         try:
             user = await bot.fetch_user(int(user_id_str))
             for wallet, wallet_data in wallets_data.items():
+                # Check circuit breaker before each wallet
+                if circuit_breaker_active and time.time() < circuit_breaker_until:
+                    print(f"[SKIP] Stopping polling due to circuit breaker")
+                    break
+                    
                 try:
                     await send_buy_notification(user, {'wallet': wallet, 'alias': wallet_data['alias'], 'last_sig': wallet_data['last_sig']})
-                    # Small delay to prevent overwhelming the API
-                    await asyncio.sleep(0.5)
+                    processed += 1
+                    # Rate limiting is handled in fetch_recent_swaps via wait_for_rate_limit()
                 except Exception as e:
                     print(f"[ERROR] Poll error for wallet {wallet[:8]}... of user {user_id_str}: {e}")
+                    skipped += 1
+                    # If it's a rate limit error, wait a bit before continuing
+                    if "429" in str(e) or "rate limit" in str(e).lower():
+                        await asyncio.sleep(10)
                     continue
         except Exception as e:
             print(f"[ERROR] Poll error for user {user_id_str}: {e}")
+            skipped += 1
             continue
     
-    # Poll global default wallets (role-wide)
-    for item in default_tracked_wallets:
-        try:
-            await send_buy_notification_global(item)
-            # Small delay to prevent overwhelming the API
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            print(f"[ERROR] Poll error for default wallet {item.get('wallet', 'unknown')[:8]}...: {e}")
-            continue
+    # Poll global default wallets (role-wide) - only if circuit breaker not active
+    if not (circuit_breaker_active and time.time() < circuit_breaker_until):
+        for item in default_tracked_wallets:
+            # Check circuit breaker before each wallet
+            if circuit_breaker_active and time.time() < circuit_breaker_until:
+                print(f"[SKIP] Stopping polling due to circuit breaker")
+                break
+                
+            try:
+                await send_buy_notification_global(item)
+                processed += 1
+                # Rate limiting is handled in fetch_recent_swaps via wait_for_rate_limit()
+            except Exception as e:
+                print(f"[ERROR] Poll error for default wallet {item.get('wallet', 'unknown')[:8]}...: {e}")
+                skipped += 1
+                # If it's a rate limit error, wait a bit before continuing
+                if "429" in str(e) or "rate limit" in str(e).lower():
+                    await asyncio.sleep(10)
+                continue
+    
+    print(f"[DEBUG] Completed polling cycle: {processed} processed, {skipped} skipped")
 
 # --- HELPER: SETUP VERIFY MESSAGE ---
 async def setup_verify_message():
@@ -705,7 +880,10 @@ def is_valid_solana_address(addr: str):
     return bool(re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{32,44}', addr))
 
 # --- HELPER: FETCH POOL DATA ---
-def fetch_meteora_pools(ca: str):
+def fetch_meteora_pools(ca: str, max_retries: int = 3):
+    """Fetch Meteora pools with rate limiting and retry logic for 429 errors."""
+    global meteora_last_request_time, meteora_circuit_breaker_active, meteora_circuit_breaker_until
+    
     print(f"[DEBUG] Fetching Meteora pools for {ca} using all_by_groups API")
     base_url = 'https://dlmm-api.meteora.ag/pair/all_by_groups'
     
@@ -713,91 +891,158 @@ def fetch_meteora_pools(ca: str):
     # API akan filter pools yang mengandung contract address ini
     target_contract = ca
     
-    try:
-        start_time = time.time()
-        print(f"[DEBUG] Using all_by_groups API: {base_url}")
-        print(f"[DEBUG] Search term: {target_contract}")
-        sys.stdout.flush()
-        
-        params = {
-            'search_term': target_contract,  # Filter by contract address
-            'sort_key': 'tvl',  # Sort by TVL untuk dapat pools teratas
-            'order_by': 'desc',  # Descending order (highest TVL first)
-            'limit': 50 # Ambil 50 pools teratas (cukup untuk sort & ambil top 10)
-        }
-        
-        print(f"[DEBUG] Making request with search_term...")
-        sys.stdout.flush()
-        
-        response = requests.get(base_url, params=params, timeout=30)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        # Extract pools from groups structure
-        matching_pools = []
-        if isinstance(data, dict) and 'groups' in data:
-            for group in data.get('groups', []):
-                pools = group.get('pairs', [])
-                for pool in pools:
-                    try:
-                        mint_x = pool.get('mint_x', '').lower()
-                        mint_y = pool.get('mint_y', '').lower()
-                        target_lower = target_contract.lower()
-                        
-                        # Double check: pool harus match dengan contract address
-                        if target_lower in [mint_x, mint_y]:
-                            name = pool.get('name', '').strip()
-                            if name:
-                                clean_name = name.replace(' DLMM', '').replace('DLMM', '').strip()
-                                separator = '/' if '/' in clean_name else '-'
-                                parts = clean_name.split(separator)
-                                if len(parts) >= 2:
-                                    pair_name = f"{parts[0].strip()}-{parts[1].strip()}"
+    # Check circuit breaker
+    now = time.time()
+    if meteora_circuit_breaker_active and now < meteora_circuit_breaker_until:
+        remaining = meteora_circuit_breaker_until - now
+        print(f"[METEORA] Circuit breaker active, waiting {remaining:.1f}s...")
+        raise Exception(f"API sedang rate limited. Coba lagi dalam {int(remaining)} detik.")
+    
+    # Rate limiting: ensure minimum delay between requests
+    if meteora_last_request_time > 0:
+        time_since_last = now - meteora_last_request_time
+        if time_since_last < METEORA_MIN_DELAY:
+            wait_time = METEORA_MIN_DELAY - time_since_last
+            print(f"[METEORA] Rate limiting: waiting {wait_time:.1f}s before request...")
+            time.sleep(wait_time)
+            now = time.time()
+    
+    params = {
+        'search_term': target_contract,  # Filter by contract address
+        'sort_key': 'tvl',  # Sort by TVL untuk dapat pools teratas
+        'order_by': 'desc',  # Descending order (highest TVL first)
+        'limit': 50 # Ambil 50 pools teratas (cukup untuk sort & ambil top 10)
+    }
+    
+    # Retry logic with exponential backoff for 429 errors
+    for attempt in range(max_retries):
+        try:
+            start_time = time.time()
+            print(f"[DEBUG] Using all_by_groups API: {base_url} (attempt {attempt + 1}/{max_retries})")
+            print(f"[DEBUG] Search term: {target_contract}")
+            sys.stdout.flush()
+            
+            print(f"[DEBUG] Making request with search_term...")
+            sys.stdout.flush()
+            
+            response = requests.get(base_url, params=params, timeout=30)
+            
+            # Handle 429 (Too Many Requests) with retry
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 60))  # Default 60 seconds
+                wait_time = min(retry_after, 120)  # Cap at 2 minutes
+                
+                if attempt < max_retries - 1:
+                    print(f"[METEORA] Rate limited (429) - waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Activate circuit breaker on final failure
+                    meteora_circuit_breaker_active = True
+                    meteora_circuit_breaker_until = time.time() + wait_time
+                    print(f"[METEORA] Max retries reached, activating circuit breaker for {wait_time}s")
+                    raise Exception(f"API rate limited. Coba lagi dalam {wait_time} detik.")
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            # Update last request time on success
+            meteora_last_request_time = time.time()
+            
+            # Reset circuit breaker on success
+            meteora_circuit_breaker_active = False
+            
+            # Extract pools from groups structure
+            matching_pools = []
+            if isinstance(data, dict) and 'groups' in data:
+                for group in data.get('groups', []):
+                    pools = group.get('pairs', [])
+                    for pool in pools:
+                        try:
+                            mint_x = pool.get('mint_x', '').lower()
+                            mint_y = pool.get('mint_y', '').lower()
+                            target_lower = target_contract.lower()
+                            
+                            # Double check: pool harus match dengan contract address
+                            if target_lower in [mint_x, mint_y]:
+                                name = pool.get('name', '').strip()
+                                if name:
+                                    clean_name = name.replace(' DLMM', '').replace('DLMM', '').strip()
+                                    separator = '/' if '/' in clean_name else '-'
+                                    parts = clean_name.split(separator)
+                                    if len(parts) >= 2:
+                                        pair_name = f"{parts[0].strip()}-{parts[1].strip()}"
+                                    else:
+                                        pair_name = clean_name
                                 else:
-                                    pair_name = clean_name
-                            else:
-                                matching_mint = mint_x if target_lower == mint_x else mint_y
-                                pair_name = f"{matching_mint[:8]} Pair"
+                                    matching_mint = mint_x if target_lower == mint_x else mint_y
+                                    pair_name = f"{matching_mint[:8]} Pair"
 
-                            liq = float(pool.get('liquidity', 0))
-                            liq_str = f"${liq/1000:.1f}K" if liq >= 1000 else f"${liq:.1f}"
-                            bin_step = pool.get('bin_step', 0)
-                            address = pool.get('address', '')
+                                liq = float(pool.get('liquidity', 0))
+                                liq_str = f"${liq/1000:.1f}K" if liq >= 1000 else f"${liq:.1f}"
+                                bin_step = pool.get('bin_step', 0)
+                                address = pool.get('address', '')
 
-                            matching_pools.append({
-                                'pair': pair_name,
-                                'bin': f"{bin_step}/5",
-                                'liq': liq_str,
-                                'raw_liq': liq,
-                                'address': address
-                            })
-                    except Exception as e:
-                        # Skip error pools, continue
-                        continue
-        
-        total_time = time.time() - start_time
-        print(f"[DEBUG] ✅ API request completed in {total_time:.2f} seconds!")
-        print(f"[DEBUG] ✅ Found {len(matching_pools)} matching pools (already filtered by API)")
-        sys.stdout.flush()
-        
-        return matching_pools
-        
-    except requests.exceptions.Timeout:
-        print("[ERROR] Request timeout - API tidak merespons dalam 30 detik")
-        raise Exception("Request timeout - API tidak merespons. Coba lagi nanti.")
-    except requests.exceptions.ConnectionError as e:
-        print(f"[ERROR] Connection error: {e}")
-        raise Exception(f"Connection error: Tidak bisa connect ke API. {str(e)}")
-    except requests.exceptions.HTTPError as e:
-        print(f"[ERROR] HTTP error: {e}")
-        raise Exception(f"HTTP error: {e}")
-    except Exception as e:
-        print(f"[ERROR] Unexpected error in fetch_meteora_pools: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.stdout.flush()
-        raise
+                                matching_pools.append({
+                                    'pair': pair_name,
+                                    'bin': f"{bin_step}/5",
+                                    'liq': liq_str,
+                                    'raw_liq': liq,
+                                    'address': address
+                                })
+                        except Exception as e:
+                            # Skip error pools, continue
+                            continue
+            
+            total_time = time.time() - start_time
+            print(f"[DEBUG] ✅ API request completed in {total_time:.2f} seconds!")
+            print(f"[DEBUG] ✅ Found {len(matching_pools)} matching pools (already filtered by API)")
+            sys.stdout.flush()
+            
+            return matching_pools
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response and e.response.status_code == 429:
+                # Already handled above, but catch here for safety
+                if attempt < max_retries - 1:
+                    wait_time = 60 * (2 ** attempt)  # Exponential backoff: 60s, 120s, 240s
+                    wait_time = min(wait_time, 120)  # Cap at 2 minutes
+                    print(f"[METEORA] Rate limited (429) - waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    meteora_circuit_breaker_active = True
+                    meteora_circuit_breaker_until = time.time() + wait_time
+                    raise Exception(f"API rate limited setelah {max_retries} percobaan. Coba lagi dalam {wait_time} detik.")
+            else:
+                print(f"[ERROR] HTTP error: {e}")
+                raise Exception(f"HTTP error: {e}")
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                wait_time = 10 * (attempt + 1)  # 10s, 20s, 30s
+                print(f"[METEORA] Request timeout - retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            print("[ERROR] Request timeout - API tidak merespons dalam 30 detik")
+            raise Exception("Request timeout - API tidak merespons. Coba lagi nanti.")
+        except requests.exceptions.ConnectionError as e:
+            if attempt < max_retries - 1:
+                wait_time = 5 * (attempt + 1)  # 5s, 10s, 15s
+                print(f"[METEORA] Connection error - retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            print(f"[ERROR] Connection error: {e}")
+            raise Exception(f"Connection error: Tidak bisa connect ke API. {str(e)}")
+        except Exception as e:
+            # Don't retry on other exceptions
+            print(f"[ERROR] Unexpected error in fetch_meteora_pools: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
+            raise
+    
+    # Should not reach here, but just in case
+    raise Exception("Gagal fetch pools setelah beberapa percobaan. Coba lagi nanti.")
 
 # --- SLASH COMMANDS UNTUK TRACK WALLET ---
 @bot.tree.command(name="add_wallet", description="Tambah wallet address untuk tracking (hanya buy transactions)")
@@ -959,10 +1204,16 @@ async def on_message(message: discord.Message):
                 traceback.print_exc()
                 await message.channel.send(f"❌ **Connection Error**: Tidak bisa connect ke API Meteora. Error: {str(e)}")
             except Exception as e:
-                print(f"[ERROR] Unexpected error: {e}")
-                import traceback
-                traceback.print_exc()
-                await message.channel.send(f"❌ **Error**: {str(e)}")
+                error_msg = str(e)
+                # Check if it's a rate limit error
+                if "rate limited" in error_msg.lower() or "429" in error_msg:
+                    print(f"[ERROR] Rate limit error in on_message: {e}")
+                    await message.channel.send(f"⚠️ **Rate Limited**: {error_msg}\n\nCoba lagi dalam beberapa saat.")
+                else:
+                    print(f"[ERROR] Unexpected error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    await message.channel.send(f"❌ **Error**: {error_msg}")
 
     # penting supaya command seperti !call tetap bisa jalan
     await bot.process_commands(message)
@@ -1244,10 +1495,16 @@ async def call_token(ctx: commands.Context, ca: str):
         print("[ERROR] Bot tidak punya izin untuk buat thread")
         await ctx.send("❌ Bot tidak punya izin untuk buat thread atau kirim pesan di sini.")
     except Exception as e:
-        print(f"[ERROR] Unexpected error in !call: {e}")
-        import traceback
-        traceback.print_exc()
-        await ctx.send(f"❌ **Error**: {str(e)}")
+        error_msg = str(e)
+        # Check if it's a rate limit error
+        if "rate limited" in error_msg.lower() or "429" in error_msg:
+            print(f"[ERROR] Rate limit error in !call: {e}")
+            await ctx.send(f"⚠️ **Rate Limited**: {error_msg}\n\nCoba lagi dalam beberapa saat.")
+        else:
+            print(f"[ERROR] Unexpected error in !call: {e}")
+            import traceback
+            traceback.print_exc()
+            await ctx.send(f"❌ **Error**: {error_msg}")
 
 # --- RUN BOT ---
 print("[DEBUG] Bot starting...")
