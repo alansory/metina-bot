@@ -11,7 +11,7 @@ import time
 import random
 from collections import deque
 from discord import app_commands
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
 # --- TOKEN ---
@@ -56,6 +56,14 @@ meteora_last_request_time = 0  # Timestamp of last Meteora API request
 METEORA_MIN_DELAY = 3  # Minimum 3 seconds between Meteora requests
 meteora_circuit_breaker_active = False
 meteora_circuit_breaker_until = 0
+
+# --- METADAO CONFIG ---
+METADAO_PROJECTS_URL = "https://metadao.fi/projects"
+METADAO_STATE_FILE = "metadao_projects_state.json"
+METADAO_POLL_INTERVAL_MINUTES = int(os.getenv("METADAO_POLL_INTERVAL", "10"))
+DAMM_CHANNEL_ID = int(os.getenv("DAMM_V2_CHANNEL_ID", "1440565218739486881")) or None
+DAMM_CHANNEL_NAME = os.getenv("DAMM_V2_CHANNEL_NAME", "damm")
+metadao_notification_state: Dict[str, Dict[str, object]] = {}
 
 async def wait_for_rate_limit():
     """Wait if we're hitting rate limits, implements token bucket pattern."""
@@ -182,9 +190,33 @@ def save_default_wallets():
     except Exception as e:
         print(f"[ERROR] Failed to save default wallets: {e}")
 
+def load_metadao_state():
+    """Load persisted MetaDAO notification state."""
+    global metadao_notification_state
+    try:
+        if os.path.exists(METADAO_STATE_FILE):
+            with open(METADAO_STATE_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    metadao_notification_state = data
+                    print(f"[DEBUG] Loaded MetaDAO state for {len(metadao_notification_state)} project(s)")
+    except Exception as e:
+        print(f"[ERROR] Failed to load MetaDAO notification state: {e}")
+        metadao_notification_state = {}
+
+def save_metadao_state():
+    """Persist MetaDAO notification state to disk."""
+    try:
+        with open(METADAO_STATE_FILE, "w") as f:
+            json.dump(metadao_notification_state, f, indent=4)
+        print("[DEBUG] Saved MetaDAO notification state")
+    except Exception as e:
+        print(f"[ERROR] Failed to save MetaDAO notification state: {e}")
+
 # Load data on startup
 load_tracked_wallets()
 load_default_wallets()
+load_metadao_state()
 
 # --- HELPER: CEK VALID SOLANA WALLET ADDRESS ---
 def is_valid_solana_wallet(addr: str):
@@ -324,6 +356,210 @@ async def fetch_token_metadata(mint: str) -> Dict[str, Optional[object]]:
 
     token_metadata_cache[mint] = {"timestamp": now, "data": metadata}
     return metadata
+
+def _extract_metadao_items(html: str) -> List[Dict[str, object]]:
+    """Extract MetaDAO launch data blob from rendered HTML."""
+    marker = '{"items":['
+    start = html.find(marker)
+    if start == -1:
+        return []
+    # Find matching closing brace for the JSON object
+    depth = 0
+    in_string = False
+    escape = False
+    end = None
+    for idx in range(start, len(html)):
+        ch = html[idx]
+        if in_string:
+            if ch == '"' and not escape:
+                in_string = False
+            escape = (ch == '\\' and not escape)
+            continue
+        if ch == '"':
+            in_string = True
+            escape = False
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+    if end is None:
+        return []
+    payload = html[start:end]
+    try:
+        data = json.loads(payload)
+        items = data.get("items", [])
+        if isinstance(items, list):
+            return items
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Failed to decode MetaDAO payload: {e}")
+    return []
+
+def _format_usd_short(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    thresholds = [
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ]
+    for threshold, suffix in thresholds:
+        if value >= threshold:
+            return f"${value/threshold:.1f}{suffix}"
+    return f"${value:,.0f}"
+
+def _metadao_amount_to_usd(value: Optional[int]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        # MetaDAO stores USD amounts in millionths (per on-site displays)
+        return float(value) / 1_000_000
+    except (TypeError, ValueError):
+        return None
+
+async def fetch_metadao_launches() -> List[Dict[str, object]]:
+    """Fetch active MetaDAO launches with remaining time."""
+    global http_session
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    try:
+        async with http_session.get(METADAO_PROJECTS_URL, timeout=aiohttp.ClientTimeout(total=20)) as response:
+            response.raise_for_status()
+            html = await response.text()
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch MetaDAO projects: {e}")
+        return []
+
+    items = _extract_metadao_items(html)
+    active_launches = []
+    now_ts = time.time()
+    for item in items:
+        remaining = item.get("timeRemaining") or {}
+        total_seconds = remaining.get("total") if isinstance(remaining, dict) else None
+        if not isinstance(total_seconds, (int, float)) or total_seconds <= 0:
+            continue
+        end_ts = now_ts + total_seconds
+        launch = {
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "description": item.get("description"),
+            "token_symbol": item.get("tokenSymbol"),
+            "price": item.get("price"),
+            "buy_url": f"https://metadao.fi/projects/{item.get('organizationSlug')}/fundraise" if item.get("organizationSlug") else METADAO_PROJECTS_URL,
+            "committed": _metadao_amount_to_usd(item.get("finalRaiseAmount")),
+            "target": _metadao_amount_to_usd(item.get("minimumRaise")),
+            "time_remaining": total_seconds,
+            "end_ts": end_ts,
+        }
+        if launch["id"]:
+            active_launches.append(launch)
+    return active_launches
+
+def _find_damm_channel() -> Optional[discord.TextChannel]:
+    if DAMM_CHANNEL_ID:
+        channel = bot.get_channel(DAMM_CHANNEL_ID)
+        if channel:
+            return channel  # type: ignore[return-value]
+    if DAMM_CHANNEL_NAME:
+        for guild in bot.guilds:
+            for channel in guild.text_channels:
+                if channel.name == DAMM_CHANNEL_NAME:
+                    return channel  # type: ignore[return-value]
+    return None
+
+def _metadao_state_for(project_id: str) -> Dict[str, object]:
+    state = metadao_notification_state.get(project_id)
+    if not isinstance(state, dict):
+        state = {}
+    return state
+
+def _user_can_run_admin_actions(user: discord.abc.User) -> bool:
+    if isinstance(user, discord.Member):
+        perms = user.guild_permissions
+        return (
+            perms.administrator
+            or perms.manage_guild
+            or perms.manage_channels
+            or perms.manage_messages
+        )
+    return False
+
+def _metadao_admin_check(interaction: discord.Interaction) -> bool:
+    if _user_can_run_admin_actions(interaction.user):
+        return True
+    raise app_commands.CheckFailure("Kamu butuh izin Manage Server untuk pakai command ini.")
+
+async def _send_metadao_embed(channel: discord.TextChannel, launch: Dict[str, object], *, reminder: bool):
+    title = "🚀 New MetaDAO Raise Live" if not reminder else "⏰ MetaDAO Raise Ending Soon"
+    end_dt = datetime.fromtimestamp(launch["end_ts"])
+    time_left_minutes = max(0, int(launch["time_remaining"] // 60))
+    desc_parts = []
+    if launch.get("description"):
+        desc_parts.append(launch["description"])
+    desc_parts.append(f"Ends at **{end_dt:%Y-%m-%d %H:%M UTC}** ({time_left_minutes} min left)")
+    embed = discord.Embed(
+        title=title,
+        description="\n\n".join(desc_parts),
+        color=0xFF7B7B if reminder else 0x3498db,
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="Project", value=f"**{launch.get('name')}**", inline=True)
+    if launch.get("token_symbol"):
+        embed.add_field(name="Ticker", value=launch["token_symbol"], inline=True)
+    price = launch.get("price")
+    if isinstance(price, (int, float)):
+        embed.add_field(name="Price", value=f"${price:.4f}", inline=True)
+    committed = _format_usd_short(launch.get("committed"))
+    target = _format_usd_short(launch.get("target"))
+    embed.add_field(name="Raised", value=f"{committed} / {target}", inline=False)
+    embed.add_field(name="MetaDAO", value=f"[Open Raise]({launch.get('buy_url')})", inline=False)
+    await channel.send(embed=embed)
+
+@tasks.loop(minutes=METADAO_POLL_INTERVAL_MINUTES or 10)
+async def poll_metadao_launches():
+    channel = _find_damm_channel()
+    if not channel:
+        print("[WARN] MetaDAO poll: damm-v2 channel not found")
+        return
+    launches = await fetch_metadao_launches()
+    print(f"[DEBUG] MetaDAO poll: {len(launches)} active launch(es) detected")
+    now_ts = time.time()
+    active_ids = set()
+    for launch in launches:
+        project_id = launch["id"]
+        if not project_id:
+            continue
+        active_ids.add(project_id)
+        state = _metadao_state_for(project_id)
+        prev_end = state.get("end_ts")
+        end_changed = not isinstance(prev_end, (int, float)) or abs(prev_end - launch["end_ts"]) > 60
+        if not state.get("start_notified") or end_changed:
+            try:
+                await _send_metadao_embed(channel, launch, reminder=False)
+                state["start_notified"] = True
+                state["reminder_sent"] = False
+                print(f"[DEBUG] MetaDAO start notification sent for {project_id}")
+            except Exception as e:
+                print(f"[ERROR] Failed to send MetaDAO start notification: {e}")
+        # Reminder logic
+        if not state.get("reminder_sent") and launch["end_ts"] - now_ts <= 3600:
+            try:
+                await _send_metadao_embed(channel, launch, reminder=True)
+                state["reminder_sent"] = True
+                print(f"[DEBUG] MetaDAO reminder sent for {project_id}")
+            except Exception as e:
+                print(f"[ERROR] Failed to send MetaDAO reminder: {e}")
+        state["end_ts"] = launch["end_ts"]
+        state["time_remaining"] = launch["time_remaining"]
+        metadao_notification_state[project_id] = state
+    # Clean up stale entries so future raises can trigger notifications again
+    for project_id in list(metadao_notification_state.keys()):
+        if project_id not in active_ids:
+            del metadao_notification_state[project_id]
+    save_metadao_state()
 
 # --- HELPER: FETCH RECENT SWAPS FROM HELIUS ---
 async def fetch_recent_swaps(wallet: str, max_retries: int = 2) -> List[Dict]:
@@ -832,6 +1068,10 @@ async def on_ready():
     if HELIUS_API_KEY:
         poll_wallet_buys.start()
         print("[DEBUG] Wallet buy polling started")
+    
+    if not poll_metadao_launches.is_running():
+        poll_metadao_launches.start()
+        print("[DEBUG] MetaDAO polling started")
 
 # --- EVENT: MEMBER BARU JOIN ---
 @bot.event
@@ -1115,6 +1355,61 @@ async def list_wallets(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
     print(f"[DEBUG] Listed wallets for user {interaction.user.name}")
+
+@bot.tree.command(name="metadao_test", description="Kirim notifikasi MetaDAO test ke channel damm")
+@app_commands.describe(
+    project_name="Nama project/raise",
+    minutes_until_end="Berapa menit lagi raise berakhir",
+    reminder="Kirim versi reminder (1 jam sebelum akhir)",
+    token_symbol="Ticker/token symbol (opsional)",
+    price="Harga token (opsional)",
+    raised="Dana yang sudah terkumpul (USD, opsional)",
+    target="Target raise (USD, opsional)",
+)
+@app_commands.check(_metadao_admin_check)
+async def metadao_test(
+    interaction: discord.Interaction,
+    project_name: str,
+    minutes_until_end: int,
+    reminder: bool = False,
+    token_symbol: Optional[str] = None,
+    price: Optional[float] = None,
+    raised: Optional[float] = None,
+    target: Optional[float] = None,
+):
+    channel = _find_damm_channel()
+    if not channel:
+        await interaction.response.send_message("❌ Channel damm-v2 tidak ditemukan. Cek konfigurasi ID/Nama channel!", ephemeral=True)
+        return
+    
+    minutes = max(1, minutes_until_end)
+    end_ts = time.time() + minutes * 60
+    launch = {
+        "id": f"TEST-{int(time.time())}",
+        "name": project_name,
+        "description": "Test notification (tidak berasal dari MetaDAO).",
+        "token_symbol": token_symbol,
+        "price": price,
+        "buy_url": METADAO_PROJECTS_URL,
+        "committed": raised,
+        "target": target,
+        "time_remaining": minutes * 60,
+        "end_ts": end_ts,
+    }
+    
+    try:
+        await _send_metadao_embed(channel, launch, reminder=reminder)
+        await interaction.response.send_message(f"✅ Notif MetaDAO test dikirim ke {channel.mention}", ephemeral=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to send MetaDAO test notification: {e}")
+        await interaction.response.send_message(f"❌ Gagal kirim notif: {e}", ephemeral=True)
+
+@metadao_test.error
+async def metadao_test_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("❌ Kamu tidak punya izin untuk menjalankan command ini.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
 
 # --- AUTO DETECT: USER PASTE CONTRACT ADDRESS (DISABLE AUTO-TRACK UNTUK WALLET YANG UDAH DI-ADD) ---
 @bot.event

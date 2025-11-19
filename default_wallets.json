@@ -1,23 +1,22 @@
 [
-  {
-    "wallet": "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6",
-    "alias": "cooker",
-    "last_sig": null
-  },
-  {
-    "wallet": "8MoW9mtbEz6z3gPuAdYb1yWhjCAxQSYqpcTb1CQgN5qb",
-    "alias": "Ashtoshii",
-    "last_sig": null
-  },
-  {
-    "wallet": "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
-    "alias": "jijo",
-    "last_sig": null
-  },
-  {
-    "wallet": "DNfuF1L62WWyW3pNakVkyGGFzVVhj4Yr52jSmdTyeBHm",
-    "alias": "gake",
-    "last_sig": null
-  }
+    {
+        "wallet": "8deJ9xeUvXSJwicYptA9mHsU2rN2pDx37KWzkDkEXhU6",
+        "alias": "cooker",
+        "last_sig": "4cX8wsw29PYQPQxDKMZjQBm5opr3kexaULT3HdxZcZeJqKvM5VDBkLtKf795qX2AWyvHALPTJQG1PFV48rrbtqX5"
+    },
+    {
+        "wallet": "8MoW9mtbEz6z3gPuAdYb1yWhjCAxQSYqpcTb1CQgN5qb",
+        "alias": "Ashtoshii",
+        "last_sig": "22Vrr8ULscvxpafjBCy8oJQyvWEqwyP8EfAbCfKf3oekBp6cGfyF5VESHVgq6zSmbeeGzRHb8rda4CUqBKTLKe1J"
+    },
+    {
+        "wallet": "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
+        "alias": "jijo",
+        "last_sig": "2dCm79KesHnHbRPESGPdtYm5LE2XAK6xr5xgRn1dBhVo6AHV9Y3Ee2UwAU1TvVC3JHSDDCVWwQLqDMrqk1UjJnXz"
+    },
+    {
+        "wallet": "DNfuF1L62WWyW3pNakVkyGGFzVVhj4Yr52jSmdTyeBHm",
+        "alias": "gake",
+        "last_sig": "4aVYS1kRXAXXvVkCjA32MiEcD8FUDU1uzEUiFxYGqimbEqKA4bSNSJe9N8DhBAreWBfbozEiuGVDEBP9ABUaVCYY"
+    }
 ]
-
