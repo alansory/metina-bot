@@ -119,7 +119,8 @@ def activate_circuit_breaker(duration: int = 300):
     print(f"[CIRCUIT_BREAKER] Activated for {duration}s due to rate limiting")
 
 # --- GANTI DENGAN CHANNEL & ROLE ID KAMU ---
-ALLOWED_CHANNEL_ID = 1428299549507584080  # Channel LP Calls
+ALLOWED_CHANNEL_ID = 1428299549507584080  # Channel LP Calls (lp-call) - untuk command !call
+THREAD_SCAN_CHANNEL_ID = 1428996637237313546  # Channel LP Chat (lp-chat) - untuk scan & archive thread lama
 MENTION_ROLE_ID = 1437345814245801994  # Role yg mau di-mention di thread
 AUTO_ROLE_ID = 1437345814245801994  # 🟢 Role default untuk member baru (setelah verifikasi)
 UNVERIFIED_ROLE_ID = 1437655801354522684  # Role unverified untuk member baru
@@ -1085,17 +1086,97 @@ async def setup_feature_message():
 
 # --- HELPER: SCAN & ARCHIVE OLD THREADS ---
 async def scan_and_archive_old_threads():
-    """Scan thread lama di channel LP Calls dan archive yang sudah lebih dari 15 menit"""
+    """Scan thread lama di channel LP Chat dan archive yang sudah lebih dari 15 menit"""
     global threads_to_archive
     
-    lp_calls_channel = bot.get_channel(ALLOWED_CHANNEL_ID)
-    if not lp_calls_channel:
-        print(f"[WARN] Channel LP Calls (ID: {ALLOWED_CHANNEL_ID}) tidak ditemukan, skip scan thread lama")
+    lp_chat_channel = bot.get_channel(THREAD_SCAN_CHANNEL_ID)
+    target_channel_id = THREAD_SCAN_CHANNEL_ID
+    
+    # Fallback: cari channel berdasarkan nama jika ID tidak ditemukan
+    if not lp_chat_channel:
+        print(f"[WARN] Channel LP Chat (ID: {THREAD_SCAN_CHANNEL_ID}) tidak ditemukan, mencari berdasarkan nama...")
+        for guild in bot.guilds:
+            for channel in guild.text_channels:
+                channel_name_lower = channel.name.lower()
+                if "lp" in channel_name_lower and "chat" in channel_name_lower:
+                    lp_chat_channel = channel
+                    target_channel_id = channel.id
+                    print(f"[DEBUG] Found channel '{channel.name}' (ID: {channel.id}) sebagai LP Chat channel")
+                    break
+            if lp_chat_channel:
+                break
+    
+    if not lp_chat_channel:
+        print(f"[WARN] Channel LP Chat tidak ditemukan, skip scan thread lama")
         return
     
     try:
-        # Fetch semua active threads di channel
-        active_threads = lp_calls_channel.threads
+        guild = lp_chat_channel.guild
+        if not guild:
+            print(f"[WARN] Guild tidak ditemukan untuk channel {THREAD_SCAN_CHANNEL_ID}")
+            return
+        
+        # Fetch channels untuk update cache dengan threads terbaru
+        try:
+            await guild.fetch_channels()
+            print(f"[DEBUG] Fetched channels to update thread cache")
+        except Exception as e:
+            print(f"[WARN] Gagal fetch_channels: {e}, lanjut dengan cache")
+        
+        # Kombinasi: ambil dari guild.threads DAN channel.threads untuk memastikan semua ter-cover
+        all_threads = []
+        seen_thread_ids = set()
+        
+        # Method 1: Dari guild.threads (setelah fetch_channels, ini akan lebih lengkap)
+        guild_threads = list(guild.threads)
+        print(f"[DEBUG] Guild has {len(guild_threads)} threads in cache")
+        print(f"[DEBUG] Looking for threads with parent_id = {target_channel_id} (channel: {lp_chat_channel.name})")
+        
+        # Debug: cek semua thread aktif untuk melihat parent_id-nya
+        threads_by_parent = {}
+        for thread in guild_threads:
+            if not isinstance(thread, discord.Thread):
+                continue
+            if thread.archived:
+                continue
+            
+            parent_id = thread.parent_id
+            if parent_id not in threads_by_parent:
+                threads_by_parent[parent_id] = []
+            threads_by_parent[parent_id].append(thread)
+        
+        # Print summary
+        print(f"[DEBUG] Active threads by parent channel:")
+        for parent_id, threads in sorted(threads_by_parent.items(), key=lambda x: len(x[1]), reverse=True)[:5]:
+            parent_channel = guild.get_channel(parent_id)
+            channel_name = parent_channel.name if parent_channel else f"Unknown ({parent_id})"
+            print(f"[DEBUG]   - {channel_name} (ID: {parent_id}): {len(threads)} threads")
+        
+        # Iterate semua threads dan filter yang dari channel LP Calls
+        for thread in guild_threads:
+            if not isinstance(thread, discord.Thread):
+                continue
+            if thread.id in seen_thread_ids:
+                continue
+            if thread.archived:
+                continue
+            
+            # Cek parent_id
+            if thread.parent_id == target_channel_id:
+                all_threads.append(thread)
+                seen_thread_ids.add(thread.id)
+        
+        # Method 2: Dari channel.threads langsung (untuk memastikan tidak ada yang terlewat dari cache)
+        channel_threads = list(lp_chat_channel.threads)
+        print(f"[DEBUG] Channel has {len(channel_threads)} threads in cache")
+        for thread in channel_threads:
+            if isinstance(thread, discord.Thread) and thread.id not in seen_thread_ids:
+                if not thread.archived:
+                    all_threads.append(thread)
+                    seen_thread_ids.add(thread.id)
+        
+        active_threads = all_threads
+        print(f"[DEBUG] Found {len(active_threads)} active (non-archived) threads in LP Chat channel")
         
         now = time.time()
         scanned_count = 0
