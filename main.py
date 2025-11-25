@@ -65,6 +65,11 @@ DAMM_CHANNEL_ID = int(os.getenv("DAMM_V2_CHANNEL_ID", "1440565218739486881")) or
 DAMM_CHANNEL_NAME = os.getenv("DAMM_V2_CHANNEL_NAME", "damm")
 metadao_notification_state: Dict[str, Dict[str, object]] = {}
 
+# --- THREAD AUTO-ARCHIVE CONFIG ---
+THREAD_AUTO_ARCHIVE_MINUTES = 15  # Auto-archive thread setelah 15 menit
+threads_to_archive: Dict[int, float] = {}  # {thread_id: created_timestamp}
+AUTO_SCAN_OLD_THREADS_ON_STARTUP = os.getenv("AUTO_SCAN_OLD_THREADS", "false").lower() == "true"  # Set ke "true" untuk enable auto-scan saat startup
+
 async def wait_for_rate_limit():
     """Wait if we're hitting rate limits, implements token bucket pattern."""
     global circuit_breaker_active, circuit_breaker_until, request_timestamps
@@ -517,6 +522,45 @@ async def _send_metadao_embed(channel: discord.TextChannel, launch: Dict[str, ob
     embed.add_field(name="Raised", value=f"{committed} / {target}", inline=False)
     embed.add_field(name="MetaDAO", value=f"[Open Raise]({launch.get('buy_url')})", inline=False)
     await channel.send(embed=embed)
+
+@tasks.loop(minutes=1)  # Check setiap 1 menit
+async def auto_archive_threads():
+    """Auto-archive thread setelah 15 menit dibuat"""
+    global threads_to_archive
+    if not threads_to_archive:
+        return
+    
+    now = time.time()
+    threads_to_remove = []
+    
+    for thread_id, created_at in list(threads_to_archive.items()):
+        elapsed_minutes = (now - created_at) / 60
+        
+        if elapsed_minutes >= THREAD_AUTO_ARCHIVE_MINUTES:
+            try:
+                # Fetch thread
+                thread = bot.get_channel(thread_id)
+                if thread and isinstance(thread, discord.Thread):
+                    if not thread.archived:
+                        await thread.edit(archived=True, locked=False)
+                        print(f"[DEBUG] Auto-archived thread {thread.name} (ID: {thread_id}) setelah {elapsed_minutes:.1f} menit")
+                    threads_to_remove.append(thread_id)
+                else:
+                    # Thread tidak ditemukan atau sudah dihapus
+                    threads_to_remove.append(thread_id)
+            except discord.NotFound:
+                # Thread sudah dihapus
+                threads_to_remove.append(thread_id)
+            except discord.Forbidden:
+                print(f"[WARN] Tidak punya izin untuk archive thread {thread_id}")
+                threads_to_remove.append(thread_id)
+            except Exception as e:
+                print(f"[ERROR] Gagal archive thread {thread_id}: {e}")
+                # Jangan remove dari list jika error, biar dicoba lagi nanti
+    
+    # Remove thread yang sudah di-archive atau error
+    for thread_id in threads_to_remove:
+        threads_to_archive.pop(thread_id, None)
 
 @tasks.loop(minutes=METADAO_POLL_INTERVAL_MINUTES or 10)
 async def poll_metadao_launches():
@@ -1039,6 +1083,69 @@ async def setup_feature_message():
         import traceback
         traceback.print_exc()
 
+# --- HELPER: SCAN & ARCHIVE OLD THREADS ---
+async def scan_and_archive_old_threads():
+    """Scan thread lama di channel LP Calls dan archive yang sudah lebih dari 15 menit"""
+    global threads_to_archive
+    
+    lp_calls_channel = bot.get_channel(ALLOWED_CHANNEL_ID)
+    if not lp_calls_channel:
+        print(f"[WARN] Channel LP Calls (ID: {ALLOWED_CHANNEL_ID}) tidak ditemukan, skip scan thread lama")
+        return
+    
+    try:
+        # Fetch semua active threads di channel
+        active_threads = lp_calls_channel.threads
+        
+        now = time.time()
+        scanned_count = 0
+        archived_count = 0
+        
+        # Scan active threads
+        for thread in active_threads:
+            if not isinstance(thread, discord.Thread):
+                continue
+            
+            scanned_count += 1
+            
+            # Skip thread yang sudah archived
+            if thread.archived:
+                continue
+            
+            # Cek umur thread (created_at timestamp)
+            if not thread.created_at:
+                # Jika tidak ada created_at, anggap thread baru dan tambahkan ke tracking
+                threads_to_archive[thread.id] = now
+                print(f"[DEBUG] Added thread '{thread.name}' to tracking (no created_at, akan di-archive dalam {THREAD_AUTO_ARCHIVE_MINUTES} menit)")
+                continue
+            
+            thread_age_seconds = (now - thread.created_at.timestamp())
+            thread_age_minutes = thread_age_seconds / 60
+            
+            # Jika thread sudah lebih dari 15 menit, langsung archive
+            if thread_age_minutes >= THREAD_AUTO_ARCHIVE_MINUTES:
+                try:
+                    await thread.edit(archived=True, locked=False)
+                    archived_count += 1
+                    print(f"[DEBUG] Archived old thread '{thread.name}' (umur: {thread_age_minutes:.1f} menit)")
+                except discord.Forbidden:
+                    print(f"[WARN] Tidak punya izin untuk archive thread {thread.id}")
+                except Exception as e:
+                    print(f"[ERROR] Gagal archive thread {thread.id}: {e}")
+            else:
+                # Thread masih baru, tambahkan ke tracking untuk auto-archive nanti
+                remaining_minutes = THREAD_AUTO_ARCHIVE_MINUTES - thread_age_minutes
+                # Simpan dengan timestamp yang sudah adjusted
+                threads_to_archive[thread.id] = now - (thread_age_minutes * 60)
+                print(f"[DEBUG] Added existing thread '{thread.name}' to tracking (akan di-archive dalam {remaining_minutes:.1f} menit)")
+        
+        print(f"[DEBUG] Scan thread lama selesai: {scanned_count} thread scanned, {archived_count} thread di-archive")
+        
+    except Exception as e:
+        print(f"[ERROR] Error saat scan thread lama: {e}")
+        import traceback
+        traceback.print_exc()
+
 # --- EVENT: BOT ONLINE ---
 @bot.event
 async def on_ready():
@@ -1072,6 +1179,18 @@ async def on_ready():
     if not poll_metadao_launches.is_running():
         poll_metadao_launches.start()
         print("[DEBUG] MetaDAO polling started")
+    
+    # Scan dan archive thread lama yang sudah ada (hanya jika flag enabled)
+    if AUTO_SCAN_OLD_THREADS_ON_STARTUP:
+        print("[DEBUG] Auto-scan thread lama enabled, scanning...")
+        await scan_and_archive_old_threads()
+    else:
+        print("[DEBUG] Auto-scan thread lama disabled (set AUTO_SCAN_OLD_THREADS=true untuk enable)")
+    
+    # Start auto-archive thread task
+    if not auto_archive_threads.is_running():
+        auto_archive_threads.start()
+        print("[DEBUG] Thread auto-archive task started (15 menit)")
 
 # --- EVENT: MEMBER BARU JOIN ---
 @bot.event
@@ -1411,6 +1530,61 @@ async def metadao_test_error(interaction: discord.Interaction, error: app_comman
     else:
         await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
 
+@bot.tree.command(name="close_thread", description="Tutup/archive thread ini (hanya bisa digunakan di dalam thread)")
+async def close_thread(interaction: discord.Interaction):
+    """Close/archive thread secara manual"""
+    # Cek apakah command dipanggil di dalam thread
+    if not isinstance(interaction.channel, discord.Thread):
+        await interaction.response.send_message("❌ Command ini hanya bisa digunakan di dalam thread!", ephemeral=True)
+        return
+    
+    thread = interaction.channel
+    
+    # Cek apakah thread sudah archived
+    if thread.archived:
+        await interaction.response.send_message("⚠️ Thread ini sudah di-archive!", ephemeral=True)
+        return
+    
+    # Cek permission: user harus punya manage_messages atau moderator/admin
+    if not _user_can_run_admin_actions(interaction.user):
+        # Atau bisa juga cek apakah user adalah pembuat thread
+        if thread.owner_id != interaction.user.id:
+            await interaction.response.send_message("❌ Kamu tidak punya izin untuk menutup thread ini. Hanya moderator/admin atau pembuat thread yang bisa menutup.", ephemeral=True)
+            return
+    
+    try:
+        # Archive thread
+        await thread.edit(archived=True, locked=False)
+        # Remove dari auto-archive queue jika ada
+        threads_to_archive.pop(thread.id, None)
+        await interaction.response.send_message("✅ Thread berhasil ditutup (archived)!")
+        print(f"[DEBUG] Thread {thread.name} di-archive oleh {interaction.user.name}")
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Bot tidak punya izin untuk menutup thread ini.", ephemeral=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to archive thread: {e}")
+        await interaction.response.send_message(f"❌ Gagal menutup thread: {e}", ephemeral=True)
+
+@bot.tree.command(name="scan_threads", description="Scan dan archive thread lama yang sudah lebih dari 15 menit (admin only)")
+@app_commands.check(_metadao_admin_check)
+async def scan_threads(interaction: discord.Interaction):
+    """Manual trigger untuk scan dan archive thread lama"""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        await scan_and_archive_old_threads()
+        await interaction.followup.send("✅ Scan thread selesai! Cek console untuk detail.", ephemeral=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to scan threads: {e}")
+        await interaction.followup.send(f"❌ Gagal scan thread: {e}", ephemeral=True)
+
+@scan_threads.error
+async def scan_threads_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("❌ Kamu tidak punya izin untuk menjalankan command ini.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
+
 # --- AUTO DETECT: USER PASTE CONTRACT ADDRESS (DISABLE AUTO-TRACK UNTUK WALLET YANG UDAH DI-ADD) ---
 @bot.event
 async def on_message(message: discord.Message):
@@ -1730,7 +1904,12 @@ async def call_token(ctx: commands.Context, ca: str):
             name=thread_name,
             type=discord.ChannelType.public_thread,
             reason=f"Thread created by {ctx.author}",
+            auto_archive_duration=60,  # Discord minimum (akan di-override oleh task 15 menit)
         )
+        
+        # Track thread untuk auto-archive setelah 15 menit
+        threads_to_archive[thread.id] = time.time()
+        print(f"[DEBUG] Thread {thread.id} ditambahkan ke auto-archive queue (15 menit)")
 
         desc = f"Found {len(pools)} Meteora DLMM pool untuk `{ca}`\n\n"
         for i, p in enumerate(pools[:10], 1):
