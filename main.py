@@ -1298,10 +1298,11 @@ async def on_member_join(member: discord.Member):
             try:
                 verify_channel_mention = f"<#{VERIFY_CHANNEL_ID}>" if VERIFY_CHANNEL_ID else "channel verify-here"
                 feature_channel_mention = f"<#{FEATURE_CHANNEL_ID}>"
+                rules_channel_mention = "<#1425708221175173121>"
                 await channel.send(
                     f"👋 Selamat datang {member.mention}!\n\n"
                     "Welcome Lpeeps👋 Selamat datang di metina.id komunitas Liquidity Provider di Indonesia 🇮🇩. "
-                    "Biar lebih afdol baca #📜｜rules & #👋｜welcome. Lets grow together 🚀\n\n"
+                    f"Biar lebih afdol baca {rules_channel_mention} & #👋｜welcome. Lets grow together 🚀\n\n"
                     f"⚠️ **Penting:** Silakan verifikasi diri kamu di {verify_channel_mention} untuk mendapatkan akses penuh ke server! ✅\n\n"
                     f"💡 **Fitur Tambahan:** Cek {feature_channel_mention} untuk aktifkan fitur seperti Track Wallet! 💼"
                 )
