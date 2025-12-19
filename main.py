@@ -133,6 +133,18 @@ TRACK_WALLET_EMOJI = "💼"  # Emoji untuk react track wallet
 TRACK_WALLET_ROLE_ID = 1437711623178686546  # Role untuk akses track wallet (buat role baru di server)
 TRACK_WALLET_CHANNEL_ID = 1437712394200809482  # Channel private untuk track wallet (set private, hanya visible untuk role ini)
 
+# --- FITUR BARU: BOT CALL - MONITOR TOKEN BARU ---
+BOT_CALL_CHANNEL_ID = int(os.getenv("BOT_CALL_CHANNEL_ID", "1443433566058053662")) or None  # Channel untuk notifikasi token baru
+BOT_CALL_MIN_MARKET_CAP = float(os.getenv("BOT_CALL_MIN_MARKET_CAP", "250000"))  # Minimum market cap: 250k USD
+BOT_CALL_MAX_MARKET_CAP = float(os.getenv("BOT_CALL_MAX_MARKET_CAP", "10000000"))  # Maximum market cap: 10jt USD
+BOT_CALL_MIN_FEES_SOL = float(os.getenv("BOT_CALL_MIN_FEES_SOL", "20"))  # Minimum total fees: 20 SOL (bukan USD)
+BOT_CALL_MIN_PRICE_CHANGE_1H = float(os.getenv("BOT_CALL_MIN_PRICE_CHANGE_1H", "50"))  # Minimum price change 1h: 50%
+BOT_CALL_POLL_INTERVAL_MINUTES = int(os.getenv("BOT_CALL_POLL_INTERVAL", "5"))  # Poll setiap 2 menit
+BOT_CALL_STATE_FILE = "bot_call_state.json"  # File untuk simpan state token yang sudah di-notifikasi
+bot_call_notified_tokens: Dict[str, str] = {}  # {token_address: date_notified (YYYY-MM-DD)}
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "efd896ec-30ed-4c89-a990-32b315e13d20")  # Jupiter API key
+USE_METEORA_FOR_FEES = os.getenv("USE_METEORA_FOR_FEES", "false").lower() == "true"  # Use Meteora for volume/fees data
+
 # --- DATA STORAGE UNTUK TRACKED WALLETS (per user) ---
 TRACKED_WALLETS_FILE = 'tracked_wallets.json'
 tracked_wallets = {}  # {user_id: {wallet: {'alias': 'nama', 'last_sig': None}}}
@@ -219,10 +231,58 @@ def save_metadao_state():
     except Exception as e:
         print(f"[ERROR] Failed to save MetaDAO notification state: {e}")
 
+def load_bot_call_state():
+    """Load persisted bot call notification state and cleanup old dates."""
+    global bot_call_notified_tokens
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        if os.path.exists(BOT_CALL_STATE_FILE):
+            with open(BOT_CALL_STATE_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    # Migrate old timestamp format to date format if needed
+                    cleaned_data = {}
+                    for addr, value in data.items():
+                        if isinstance(value, (int, float)):
+                            # Old format: timestamp, convert to date
+                            ts = value if value > 1e10 else value * 1000
+                            date = datetime.fromtimestamp(ts / 1000 if ts > 1e10 else ts).strftime("%Y-%m-%d")
+                            if date == today:
+                                cleaned_data[addr] = date
+                        elif isinstance(value, str):
+                            # New format: date string
+                            if value == today:
+                                cleaned_data[addr] = value
+                    
+                    bot_call_notified_tokens = cleaned_data
+                    print(f"[DEBUG] Loaded bot call state for {len(bot_call_notified_tokens)} token(s) (today: {today})")
+                    
+                    # Save cleaned data if we removed old entries
+                    if len(cleaned_data) != len(data):
+                        save_bot_call_state()
+                else:
+                    bot_call_notified_tokens = {}
+        else:
+            bot_call_notified_tokens = {}
+    except Exception as e:
+        print(f"[ERROR] Failed to load bot call state: {e}")
+        bot_call_notified_tokens = {}
+
+def save_bot_call_state():
+    """Persist bot call notification state to disk."""
+    try:
+        with open(BOT_CALL_STATE_FILE, "w") as f:
+            json.dump(bot_call_notified_tokens, f, indent=4)
+        print("[DEBUG] Saved bot call state")
+    except Exception as e:
+        print(f"[ERROR] Failed to save bot call state: {e}")
+
 # Load data on startup
 load_tracked_wallets()
 load_default_wallets()
 load_metadao_state()
+load_bot_call_state()
 
 # --- HELPER: CEK VALID SOLANA WALLET ADDRESS ---
 def is_valid_solana_wallet(addr: str):
@@ -605,6 +665,665 @@ async def poll_metadao_launches():
         if project_id not in active_ids:
             del metadao_notification_state[project_id]
     save_metadao_state()
+
+# --- HELPER: FETCH VOLUME/FEES FROM METEORA ---
+def fetch_meteora_volume_and_fees(token_address: str) -> Tuple[Optional[float], Optional[float]]:
+    """Fetch volume and fees data from Meteora pools for a token address.
+    Returns: (volume_24h_usd, fees_24h_usd)"""
+    if not USE_METEORA_FOR_FEES:
+        return None, None
+    
+    try:
+        # Meteora API endpoint untuk pools
+        url = 'https://dlmm-api.meteora.ag/pair/all_by_groups'
+        params = {
+            'search_term': token_address,
+            'sort_key': 'tvl',
+            'order_by': 'desc',
+            'limit': 20  # Ambil lebih banyak pools untuk akumulasi
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code != 200:
+            return None, None
+        
+        data = response.json()
+        total_volume_24h = 0
+        total_fees_24h = 0
+        
+        # Extract volume and fees from pools
+        if isinstance(data, dict) and 'groups' in data:
+            for group in data.get('groups', []):
+                pools = group.get('pairs', [])
+                for pool in pools:
+                    try:
+                        # Meteora API provides volume and fees data
+                        volume_24h = (
+                            pool.get('trade_volume_24h') or 
+                            (pool.get('volume', {}).get('hour_24') if isinstance(pool.get('volume'), dict) else None) or
+                            pool.get('volume24h') or
+                            pool.get('volume_24h')
+                        )
+                        
+                        fees_24h = (
+                            pool.get('fees_24h') or
+                            (pool.get('fees', {}).get('hour_24') if isinstance(pool.get('fees'), dict) else None) or
+                            pool.get('fees24h') or
+                            pool.get('fees_24h')
+                        )
+                        
+                        if volume_24h:
+                            try:
+                                total_volume_24h += float(volume_24h)
+                            except (ValueError, TypeError):
+                                pass
+                        
+                        if fees_24h:
+                            try:
+                                total_fees_24h += float(fees_24h)
+                            except (ValueError, TypeError):
+                                pass
+                    except Exception:
+                        continue
+        
+        volume = total_volume_24h if total_volume_24h > 0 else None
+        fees = total_fees_24h if total_fees_24h > 0 else None
+        
+        return volume, fees
+    except Exception as e:
+        print(f"[DEBUG] Error fetching Meteora data for {token_address[:8]}...: {e}")
+        return None, None
+
+# --- HELPER: FETCH SOL PRICE ---
+async def fetch_sol_price() -> float:
+    """Fetch SOL price in USD. Try multiple sources: CoinGecko, Jupiter, then default."""
+    global http_session
+    default_price = 125.0
+    
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    # Try CoinGecko first (more reliable)
+    try:
+        async with http_session.get("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if response.status == 200:
+                data = await response.json()
+                if "solana" in data and "usd" in data["solana"]:
+                    price = float(data["solana"]["usd"])
+                    print(f"[INFO] SOL Price from CoinGecko: ${price:.2f}")
+                    return price
+    except Exception as e:
+        print(f"[DEBUG] CoinGecko price fetch failed: {e}")
+    
+    # Try Jupiter as fallback
+    try:
+        price_url = "https://price.jup.ag/v4/price?ids=SOL"
+        async with http_session.get(price_url, timeout=aiohttp.ClientTimeout(total=10)) as price_resp:
+            if price_resp.status == 200:
+                price_data = await price_resp.json()
+                if "data" in price_data and "SOL" in price_data["data"]:
+                    price = float(price_data["data"]["SOL"].get("price", default_price))
+                    print(f"[INFO] SOL Price from Jupiter: ${price:.2f}")
+                    return price
+    except Exception as e:
+        print(f"[DEBUG] Jupiter price fetch failed: {e}")
+    
+    print(f"[WARN] Could not fetch SOL price from any source, using default ${default_price}")
+    return default_price
+
+# --- HELPER: FETCH NEW TOKENS FROM JUPITER API ---
+async def fetch_new_tokens() -> List[Dict[str, object]]:
+    """Fetch new tokens from Jupiter API that meet criteria."""
+    global http_session
+    
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    try:
+        url = f"https://api.jup.ag/tokens/v2/toptraded/1h?limit=100&minMcap={int(BOT_CALL_MIN_MARKET_CAP)}&maxMcap={int(BOT_CALL_MAX_MARKET_CAP)}"
+        headers = {
+            "x-api-key": JUPITER_API_KEY
+        }
+        
+        print(f"[DEBUG] Fetching top traded tokens (1h) from Jupiter API (mcap: ${BOT_CALL_MIN_MARKET_CAP:,.0f} - ${BOT_CALL_MAX_MARKET_CAP:,.0f})...")
+        async with http_session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status == 429:
+                print("[WARN] Jupiter API rate limited, skipping...")
+                return []
+            
+            response.raise_for_status()
+            data = await response.json()
+            
+            # Jupiter API returns list of tokens (already Solana-only)
+            tokens = data if isinstance(data, list) else []
+            print(f"[DEBUG] Jupiter API returned {len(tokens)} token(s)")
+            
+            if not tokens:
+                return []
+            
+            # Get SOL price for fee conversion (try CoinGecko first, then Jupiter)
+            sol_price_usd = await fetch_sol_price()
+            
+            qualifying_tokens = []
+            now = time.time()
+            
+            for token in tokens:
+                try:
+                    # toptraded endpoint uses "id" instead of "address"
+                    token_address = token.get("id") or token.get("address")
+                    if not token_address or not is_valid_solana_address(token_address):
+                        continue
+                    
+                    # Get token metadata
+                    token_name = token.get("name", "Unknown")
+                    token_symbol = token.get("symbol", "UNKNOWN")
+                    
+                    # Get market cap from token data (toptraded uses "mcap" or "fdv")
+                    market_cap = None
+                    if "mcap" in token:
+                        try:
+                            market_cap = float(token["mcap"])
+                        except (ValueError, TypeError):
+                            pass
+                    if not market_cap and "fdv" in token:
+                        try:
+                            market_cap = float(token["fdv"])
+                        except (ValueError, TypeError):
+                            pass
+                    if not market_cap and "marketCap" in token:
+                        try:
+                            market_cap = float(token["marketCap"])
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Get volume 24h from stats24h (toptraded endpoint structure)
+                    volume_24h_usd = None
+                    stats24h = token.get("stats24h", {})
+                    stats1h = token.get("stats1h", {})
+                    if isinstance(stats24h, dict):
+                        buy_volume = stats24h.get("buyVolume", 0) or 0
+                        sell_volume = stats24h.get("sellVolume", 0) or 0
+                        try:
+                            volume_24h_usd = float(buy_volume) + float(sell_volume)
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Fallback to volume24h if stats24h not available
+                    if not volume_24h_usd and "volume24h" in token:
+                        try:
+                            volume_24h_usd = float(token["volume24h"])
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Get price change 1h from stats1h
+                    price_change_1h = None
+                    if stats1h and isinstance(stats1h, dict):
+                        price_change_1h = stats1h.get("priceChange")
+                        if price_change_1h is not None:
+                            try:
+                                price_change_1h = float(price_change_1h)
+                            except (ValueError, TypeError):
+                                price_change_1h = None
+                    
+                    # Try to get volume and fees from Meteora if enabled
+                    meteora_volume = None
+                    meteora_fees = None
+                    if USE_METEORA_FOR_FEES:
+                        meteora_volume, meteora_fees = fetch_meteora_volume_and_fees(token_address)
+                    
+                    # Use Meteora volume if it's higher than Jupiter volume
+                    if meteora_volume and meteora_volume > (volume_24h_usd or 0):
+                        volume_24h_usd = meteora_volume
+                    
+                    # Calculate fees: prefer Meteora fees if available, otherwise calculate from volume
+                    if meteora_fees and meteora_fees > 0:
+                        total_fees_usd = meteora_fees
+                    else:
+                        # Calculate fees (0.3% of volume is typical for DEX fees)
+                        fee_percentage = 0.003
+                        total_fees_usd = volume_24h_usd * fee_percentage if volume_24h_usd else 0
+                    
+                    total_fees_sol = total_fees_usd / sol_price_usd if sol_price_usd and total_fees_usd > 0 else 0
+                    
+                    # Check criteria
+                    market_cap_ok = market_cap and market_cap >= BOT_CALL_MIN_MARKET_CAP and market_cap <= BOT_CALL_MAX_MARKET_CAP
+                    fees_ok = total_fees_sol >= BOT_CALL_MIN_FEES_SOL
+                    price_change_1h_ok = price_change_1h is not None and price_change_1h >= BOT_CALL_MIN_PRICE_CHANGE_1H
+                    
+                    if not (market_cap_ok and fees_ok and price_change_1h_ok):
+                        continue
+                    
+                    # Get additional data
+                    price_usd = token.get("usdPrice") or token.get("price") or None
+                    if price_usd:
+                        try:
+                            price_usd = float(price_usd)
+                        except (ValueError, TypeError):
+                            price_usd = None
+                    
+                    liquidity_usd = token.get("liquidity") or None
+                    if liquidity_usd:
+                        try:
+                            liquidity_usd = float(liquidity_usd)
+                        except (ValueError, TypeError):
+                            liquidity_usd = None
+                    
+                    # Get price change 24h from stats24h
+                    price_change_24h = None
+                    if stats24h and isinstance(stats24h, dict):
+                        price_change_24h = stats24h.get("priceChange")
+                        if price_change_24h:
+                            try:
+                                price_change_24h = float(price_change_24h)
+                            except (ValueError, TypeError):
+                                price_change_24h = None
+                    
+                    # Fallback to priceChange24h
+                    if not price_change_24h:
+                        price_change_24h = token.get("priceChange24h") or None
+                        if price_change_24h:
+                            try:
+                                price_change_24h = float(price_change_24h)
+                            except (ValueError, TypeError):
+                                price_change_24h = None
+                    
+                    # Check if token is new (created within last 2 hours)
+                    created_at = token.get("createdAt") or token.get("created_at") or token.get("firstPool", {}).get("createdAt")
+                    is_new = True
+                    if created_at:
+                        try:
+                            # Handle ISO string format (e.g., "2025-01-29T23:29:10Z")
+                            if isinstance(created_at, str):
+                                if created_at.isdigit():
+                                    # Timestamp string
+                                    created_ts = int(created_at)
+                                else:
+                                    # ISO format string - parse it
+                                    try:
+                                        dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                                        created_ts = dt.timestamp()
+                                    except:
+                                        created_ts = 0
+                            elif isinstance(created_at, (int, float)):
+                                created_ts = created_at if created_at > 1e10 else created_at * 1000
+                            else:
+                                created_ts = 0
+                            
+                            if created_ts > 0:
+                                created_ts_seconds = created_ts / 1000 if created_ts > 1e10 else created_ts
+                                age_hours = (now - created_ts_seconds) / 3600
+                                if age_hours > 2:
+                                    is_new = False
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Skip old tokens unless fees are very high
+                    if not is_new and total_fees_sol < BOT_CALL_MIN_FEES_SOL * 2:
+                        continue
+                    
+                    qualifying_tokens.append({
+                        "address": token_address,
+                        "name": token_name,
+                        "symbol": token_symbol,
+                        "market_cap": market_cap,
+                        "total_fees_sol": total_fees_sol,
+                        "total_fees_usd": total_fees_usd,
+                        "price_usd": price_usd,
+                        "liquidity_usd": liquidity_usd,
+                        "volume_24h": volume_24h_usd,
+                        "price_change_24h": price_change_24h,
+                        "price_change_1h": price_change_1h,
+                        "created_at": created_at,
+                    })
+                    
+                except Exception as e:
+                    print(f"[ERROR] Error processing token: {e}")
+                    continue
+            
+            # Sort by market cap
+            qualifying_tokens.sort(key=lambda x: x.get("market_cap", 0), reverse=True)
+            print(f"[DEBUG] Found {len(qualifying_tokens)} qualifying token(s)")
+            return qualifying_tokens
+            
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch tokens from Jupiter: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+# --- HELPER: SEND BOT CALL NOTIFICATION ---
+async def send_bot_call_notification(token_data: Dict[str, object]):
+    """Send notification to bot call channel for new token."""
+    if not BOT_CALL_CHANNEL_ID:
+        print("[WARN] BOT_CALL_CHANNEL_ID not set, skipping notification")
+        return
+    
+    channel = bot.get_channel(BOT_CALL_CHANNEL_ID)
+    if not channel:
+        print(f"[WARN] Bot call channel with ID {BOT_CALL_CHANNEL_ID} not found")
+        return
+    
+    try:
+        token_address = token_data.get("address")
+        token_name = token_data.get("name", "Unknown")
+        token_symbol = token_data.get("symbol", "UNKNOWN")
+        market_cap = token_data.get("market_cap")
+        total_fees_sol = token_data.get("total_fees_sol", 0)
+        total_fees_usd = token_data.get("total_fees_usd", 0)
+        price_usd = token_data.get("price_usd")
+        liquidity_usd = token_data.get("liquidity_usd")
+        volume_24h = token_data.get("volume_24h")
+        price_change_24h = token_data.get("price_change_24h")
+        
+        # Format values
+        market_cap_str = _format_usd(market_cap)
+        fees_sol_str = f"{total_fees_sol:.2f} SOL" if total_fees_sol > 0 else "N/A"
+        fees_usd_str = _format_usd(total_fees_usd) if total_fees_usd > 0 else "N/A"
+        
+        # Try to fetch Meteora pools to get pool address for link
+        meteora_pool_address = None
+        try:
+            pools = fetch_meteora_pools(token_address)
+            if pools:
+                pools.sort(key=lambda x: x.get('raw_liq', 0), reverse=True)
+                top_pool = pools[0]
+                meteora_pool_address = top_pool.get('address')
+        except Exception as e:
+            print(f"[DEBUG] Could not fetch Meteora pools for link: {e}")
+        
+        embed = discord.Embed(
+            title=f"🆕 New Token Detected: {token_symbol}",
+            description=f"**{token_name}** (`{token_symbol}`)\n\nToken baru terdeteksi dengan kriteria:\n• Market Cap: {market_cap_str}\n• Total Fees (24h): {fees_sol_str} ({fees_usd_str})",
+            color=0x00ff00,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(name="Market Cap", value=market_cap_str, inline=True)
+        embed.add_field(name="Total Fees (24h)", value=f"{fees_sol_str}\n({fees_usd_str})", inline=True)
+        
+        if price_usd:
+            embed.add_field(name="Price", value=f"${price_usd:.8f}", inline=True)
+        
+        if volume_24h:
+            embed.add_field(name="Volume (24h)", value=_format_usd(volume_24h), inline=True)
+        
+        if liquidity_usd:
+            embed.add_field(name="Liquidity", value=_format_usd(liquidity_usd), inline=True)
+        
+        price_change_1h = token_data.get("price_change_1h")
+        if price_change_1h is not None:
+            change_emoji_1h = "📈" if price_change_1h >= 0 else "📉"
+            embed.add_field(name="Price Change (1h)", value=f"{change_emoji_1h} {price_change_1h:+.2f}%", inline=True)
+        
+        if price_change_24h is not None:
+            change_emoji = "📈" if price_change_24h >= 0 else "📉"
+            embed.add_field(name="Price Change (24h)", value=f"{change_emoji} {price_change_24h:+.2f}%", inline=True)
+        
+        # Add links (including Meteora with pool address if available)
+        links_value = (
+            f"[🔍 Solscan](https://solscan.io/token/{token_address})\n"
+            f"[🪐 Jupiter](https://jup.ag/tokens/{token_address})\n"
+            f"[📊 GMGN](https://gmgn.ai/sol/token/{token_address})"
+        )
+        
+        # Add Meteora link with pool address if available, otherwise use search
+        if meteora_pool_address:
+            links_value += f"\n[🌊 Meteora](https://app.meteora.ag/dlmm/{meteora_pool_address})"
+        else:
+            # Fallback: link to Meteora search (if they have search page)
+            links_value += f"\n[🌊 Meteora](https://app.meteora.ag)"
+        
+        embed.add_field(name="🔗 Links", value=links_value, inline=False)
+        
+        embed.set_footer(text=f"Token Address: {token_address[:8]}...{token_address[-8:]}")
+        
+        # Create button view for creating thread (admin only)
+        class CreateThreadView(discord.ui.View):
+            def __init__(self, token_address: str, token_symbol: str, token_name: str):
+                super().__init__(timeout=None)
+                self.token_address = token_address
+                self.token_symbol = token_symbol
+                self.token_name = token_name
+            
+            @discord.ui.button(label="📝 Create LP Call Thread", style=discord.ButtonStyle.primary)
+            async def create_thread_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+                # Check if user is admin/moderator
+                admin_roles = ["Moderator", "admin", "Admin"]
+                user_roles = [role.name for role in interaction.user.roles]
+                is_admin = any(role in admin_roles for role in user_roles)
+                
+                if not is_admin:
+                    await interaction.response.send_message("❌ Hanya admin yang bisa membuat thread!", ephemeral=True)
+                    return
+                
+                await interaction.response.defer(ephemeral=True)
+                
+                try:
+                    # Get LP Calls channel
+                    lp_calls_channel = bot.get_channel(ALLOWED_CHANNEL_ID)
+                    if not lp_calls_channel:
+                        await interaction.followup.send("❌ LP Calls channel tidak ditemukan!", ephemeral=True)
+                        return
+                    
+                    # Create thread name
+                    thread_name = f"{self.token_symbol}-{self.token_name[:20]}" if len(self.token_name) > 20 else f"{self.token_symbol}-{self.token_name}"
+                    thread_name = thread_name.replace(" ", "").replace("/", "-")[:100]  # Discord limit
+                    
+                    # Create thread
+                    thread = await lp_calls_channel.create_thread(
+                        name=thread_name,
+                        type=discord.ChannelType.public_thread,
+                        reason=f"Thread created by {interaction.user} via bot call button",
+                        auto_archive_duration=60,
+                    )
+                    
+                    # Track thread for auto-archive
+                    threads_to_archive[thread.id] = time.time()
+                    
+                    # Fetch Meteora pools
+                    try:
+                        pools = fetch_meteora_pools(self.token_address)
+                        pools.sort(key=lambda x: x['raw_liq'], reverse=True)
+                        
+                        if pools:
+                            desc = f"Found {len(pools)} Meteora DLMM pool untuk `{self.token_address}`\n\n"
+                            for i, p in enumerate(pools[:10], 1):
+                                link = f"https://app.meteora.ag/dlmm/{p['address']}"
+                                desc += f"{i}. [{p['pair']}]({link}) {p['bin']} - LQ: {p['liq']}\n"
+                            
+                            pool_embed = discord.Embed(
+                                title=f"Meteora DLMM Pools — {thread_name}",
+                                description=desc,
+                                color=0x00ff00
+                            )
+                            await thread.send(embed=pool_embed)
+                    except Exception as e:
+                        print(f"[DEBUG] Error fetching Meteora pools: {e}")
+                    
+                    # Send contract info embed
+                    contract_embed = discord.Embed(
+                        title=f"💬 Thread created for `{thread_name}`",
+                        description=f"**Contract Address:** `{self.token_address}`",
+                        color=0x3498db
+                    )
+                    # Get top pool address for Meteora link
+                    meteora_link = "https://app.meteora.ag"
+                    if pools:
+                        top_pool = pools[0]
+                        pool_addr = top_pool.get('address')
+                        if pool_addr:
+                            meteora_link = f"https://app.meteora.ag/dlmm/{pool_addr}"
+                    
+                    contract_embed.add_field(
+                        name="🔗 Links",
+                        value=(
+                            f"[🔍 Solscan](https://solscan.io/token/{self.token_address})\n"
+                            f"[🪐 Jupiter](https://jup.ag/tokens/{self.token_address})\n"
+                            f"[📊 GMGN](https://gmgn.ai/sol/token/{self.token_address})\n"
+                            f"[🌊 Meteora]({meteora_link})"
+                        ),
+                        inline=False
+                    )
+                    
+                    mention_text = f"<@&{MENTION_ROLE_ID}>" if MENTION_ROLE_ID else ""
+                    await thread.send(f"{mention_text}", embed=contract_embed)
+                    
+                    thread_link = f"https://discord.com/channels/{interaction.guild.id}/{thread.id}"
+                    await interaction.followup.send(
+                        f"✅ Thread berhasil dibuat!\n[🔗 Open Thread]({thread_link})",
+                        ephemeral=True
+                    )
+                    
+                    print(f"[DEBUG] Thread {thread.id} created by {interaction.user.name} via bot call button")
+                    
+                except discord.Forbidden:
+                    await interaction.followup.send("❌ Bot tidak punya izin untuk membuat thread!", ephemeral=True)
+                except Exception as e:
+                    await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+                    print(f"[ERROR] Error creating thread: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        view = CreateThreadView(token_address, token_symbol, token_name)
+        await channel.send(embed=embed, view=view)
+        print(f"[DEBUG] Bot call notification sent for {token_symbol} ({token_address[:8]}...)")
+        
+        # Mark as notified (with today's date)
+        today = datetime.now().strftime("%Y-%m-%d")
+        bot_call_notified_tokens[token_address] = today
+        save_bot_call_state()
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to send bot call notification: {e}")
+        import traceback
+        traceback.print_exc()
+
+# --- BACKGROUND TASK: POLL NEW TOKENS ---
+@tasks.loop(minutes=BOT_CALL_POLL_INTERVAL_MINUTES or 2)
+async def poll_new_tokens():
+    """Poll Jupiter API for new tokens and send notifications."""
+    if not BOT_CALL_CHANNEL_ID:
+        return
+    
+    try:
+        new_tokens = await fetch_new_tokens()
+        
+        # Get today's date
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        # Cleanup tokens from previous days (keep only today's)
+        old_tokens = [
+            addr for addr, date in bot_call_notified_tokens.items()
+            if date != today
+        ]
+        for addr in old_tokens:
+            del bot_call_notified_tokens[addr]
+        if old_tokens:
+            save_bot_call_state()
+        
+        if not new_tokens:
+            return
+        
+        # Filter out tokens already notified today
+        unnotified_tokens = [
+            token for token in new_tokens
+            if token.get("address") not in bot_call_notified_tokens or 
+               bot_call_notified_tokens.get(token.get("address")) != today
+        ]
+        
+        if not unnotified_tokens:
+            return
+        
+        # Calculate score for each token (prioritize market cap 60%, fees 40%)
+        def calculate_score(token):
+            market_cap = token.get("market_cap", 0) or 0
+            fees_sol = token.get("total_fees_sol", 0) or 0
+            market_cap_score = (market_cap / 1_000_000) * 0.6
+            fees_score = (fees_sol / 100) * 0.4
+            return market_cap_score + fees_score
+        
+        # Sort by score and get best token
+        unnotified_tokens.sort(key=calculate_score, reverse=True)
+        best_token = unnotified_tokens[0]
+        
+        print(f"[DEBUG] Selected BEST token: {best_token.get('symbol')} (score: {calculate_score(best_token):.2f}, market cap: ${best_token.get('market_cap', 0):,.0f}, fees: {best_token.get('total_fees_sol', 0):.2f} SOL)")
+        
+        await send_bot_call_notification(best_token)
+        
+        # Cleanup tokens from previous days (keep only today's)
+        today = datetime.now().strftime("%Y-%m-%d")
+        old_tokens = [
+            addr for addr, date in bot_call_notified_tokens.items()
+            if date != today
+        ]
+        for addr in old_tokens:
+            del bot_call_notified_tokens[addr]
+        if old_tokens:
+            save_bot_call_state()
+            
+    except Exception as e:
+        print(f"[ERROR] Error in poll_new_tokens: {e}")
+        import traceback
+        traceback.print_exc()
+
+async def trigger_bot_call_manual():
+    """Manually trigger bot call notification (for testing)."""
+    if not BOT_CALL_CHANNEL_ID:
+        return False, "BOT_CALL_CHANNEL_ID not set"
+    
+    try:
+        new_tokens = await fetch_new_tokens()
+        
+        # Get today's date
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        # Cleanup tokens from previous days (keep only today's)
+        old_tokens = [
+            addr for addr, date in bot_call_notified_tokens.items()
+            if date != today
+        ]
+        for addr in old_tokens:
+            del bot_call_notified_tokens[addr]
+        if old_tokens:
+            save_bot_call_state()
+        
+        if not new_tokens:
+            return False, "No tokens found that meet the criteria"
+        
+        # Filter out tokens already notified today
+        unnotified_tokens = [
+            token for token in new_tokens
+            if token.get("address") not in bot_call_notified_tokens or 
+               bot_call_notified_tokens.get(token.get("address")) != today
+        ]
+        
+        if not unnotified_tokens:
+            return False, "All tokens have already been notified today"
+        
+        # Calculate score for each token (prioritize market cap 60%, fees 40%)
+        def calculate_score(token):
+            market_cap = token.get("market_cap", 0) or 0
+            fees_sol = token.get("total_fees_sol", 0) or 0
+            market_cap_score = (market_cap / 1_000_000) * 0.6
+            fees_score = (fees_sol / 100) * 0.4
+            return market_cap_score + fees_score
+        
+        # Sort by score and get best token
+        unnotified_tokens.sort(key=calculate_score, reverse=True)
+        best_token = unnotified_tokens[0]
+        
+        print(f"[DEBUG] Manual trigger - Selected BEST token: {best_token.get('symbol')} (score: {calculate_score(best_token):.2f}, market cap: ${best_token.get('market_cap', 0):,.0f}, fees: {best_token.get('total_fees_sol', 0):.2f} SOL)")
+        
+        await send_bot_call_notification(best_token)
+        
+        return True, f"Sent notification for {best_token.get('symbol')} ({best_token.get('name')})"
+        
+    except Exception as e:
+        error_msg = f"Error: {str(e)}"
+        print(f"[ERROR] Error in trigger_bot_call_manual: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, error_msg
 
 # --- HELPER: FETCH RECENT SWAPS FROM HELIUS ---
 async def fetch_recent_swaps(wallet: str, max_retries: int = 2) -> List[Dict]:
@@ -1261,6 +1980,14 @@ async def on_ready():
         poll_metadao_launches.start()
         print("[DEBUG] MetaDAO polling started")
     
+    # Start bot call polling task if channel ID is set
+    if BOT_CALL_CHANNEL_ID:
+        if not poll_new_tokens.is_running():
+            poll_new_tokens.start()
+            print(f"[DEBUG] Bot call polling started (market cap: {BOT_CALL_MIN_MARKET_CAP:,.0f} - {BOT_CALL_MAX_MARKET_CAP:,.0f}, fees >= {BOT_CALL_MIN_FEES_SOL} SOL, price change 1h >= {BOT_CALL_MIN_PRICE_CHANGE_1H}%)")
+    else:
+        print("[WARN] BOT_CALL_CHANNEL_ID not set - bot call monitoring disabled")
+    
     # Scan dan archive thread lama yang sudah ada (hanya jika flag enabled)
     if AUTO_SCAN_OLD_THREADS_ON_STARTUP:
         print("[DEBUG] Auto-scan thread lama enabled, scanning...")
@@ -1556,6 +2283,24 @@ async def list_wallets(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
     print(f"[DEBUG] Listed wallets for user {interaction.user.name}")
+
+@bot.tree.command(name="botcall_test", description="Trigger bot call notification manually (for testing)")
+async def botcall_test(interaction: discord.Interaction):
+    """Manually trigger bot call notification for testing."""
+    if not BOT_CALL_CHANNEL_ID:
+        await interaction.response.send_message("❌ BOT_CALL_CHANNEL_ID not set. Bot call is disabled.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        success, message = await trigger_bot_call_manual()
+        if success:
+            await interaction.followup.send(f"✅ {message}\n\nCheck the bot call channel to see the notification!", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ {message}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name="metadao_test", description="Kirim notifikasi MetaDAO test ke channel damm")
 @app_commands.describe(
