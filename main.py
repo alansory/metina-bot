@@ -138,7 +138,7 @@ BOT_CALL_CHANNEL_ID = int(os.getenv("BOT_CALL_CHANNEL_ID", "1443433566058053662"
 BOT_CALL_MIN_MARKET_CAP = float(os.getenv("BOT_CALL_MIN_MARKET_CAP", "250000"))  # Minimum market cap: 250k USD
 BOT_CALL_MAX_MARKET_CAP = float(os.getenv("BOT_CALL_MAX_MARKET_CAP", "10000000"))  # Maximum market cap: 10jt USD
 BOT_CALL_MIN_FEES_SOL = float(os.getenv("BOT_CALL_MIN_FEES_SOL", "20"))  # Minimum total fees: 20 SOL (bukan USD)
-BOT_CALL_MIN_PRICE_CHANGE_1H = float(os.getenv("BOT_CALL_MIN_PRICE_CHANGE_1H", "50"))  # Minimum price change 1h: 50%
+BOT_CALL_MIN_PRICE_CHANGE_1H = float(os.getenv("BOT_CALL_MIN_PRICE_CHANGE_1H", "20"))  # Minimum price change 1h: 50%
 BOT_CALL_POLL_INTERVAL_MINUTES = int(os.getenv("BOT_CALL_POLL_INTERVAL", "5"))  # Poll setiap 2 menit
 BOT_CALL_STATE_FILE = "bot_call_state.json"  # File untuk simpan state token yang sudah di-notifikasi
 bot_call_notified_tokens: Dict[str, str] = {}  # {token_address: date_notified (YYYY-MM-DD)}
@@ -745,6 +745,7 @@ async def fetch_sol_price() -> float:
     
     # Try CoinGecko first (more reliable)
     try:
+        print(f"[DEBUG] Fetching SOL price from CoinGecko...")
         async with http_session.get("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", timeout=aiohttp.ClientTimeout(total=10)) as response:
             if response.status == 200:
                 data = await response.json()
@@ -752,11 +753,22 @@ async def fetch_sol_price() -> float:
                     price = float(data["solana"]["usd"])
                     print(f"[INFO] SOL Price from CoinGecko: ${price:.2f}")
                     return price
+                else:
+                    print(f"[DEBUG] CoinGecko response missing solana/usd data: {data}")
+            else:
+                print(f"[DEBUG] CoinGecko returned status {response.status}")
+    except aiohttp.ClientError as e:
+        print(f"[DEBUG] CoinGecko connection error: {type(e).__name__}: {e}")
+    except asyncio.TimeoutError:
+        print(f"[DEBUG] CoinGecko request timeout")
     except Exception as e:
-        print(f"[DEBUG] CoinGecko price fetch failed: {e}")
+        print(f"[DEBUG] CoinGecko price fetch failed: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Try Jupiter as fallback
     try:
+        print(f"[DEBUG] Fetching SOL price from Jupiter (fallback)...")
         price_url = "https://price.jup.ag/v4/price?ids=SOL"
         async with http_session.get(price_url, timeout=aiohttp.ClientTimeout(total=10)) as price_resp:
             if price_resp.status == 200:
@@ -765,8 +777,18 @@ async def fetch_sol_price() -> float:
                     price = float(price_data["data"]["SOL"].get("price", default_price))
                     print(f"[INFO] SOL Price from Jupiter: ${price:.2f}")
                     return price
+                else:
+                    print(f"[DEBUG] Jupiter response missing data/SOL: {price_data}")
+            else:
+                print(f"[DEBUG] Jupiter returned status {price_resp.status}")
+    except aiohttp.ClientError as e:
+        print(f"[DEBUG] Jupiter connection error: {type(e).__name__}: {e}")
+    except asyncio.TimeoutError:
+        print(f"[DEBUG] Jupiter request timeout")
     except Exception as e:
-        print(f"[DEBUG] Jupiter price fetch failed: {e}")
+        print(f"[DEBUG] Jupiter price fetch failed: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
     
     print(f"[WARN] Could not fetch SOL price from any source, using default ${default_price}")
     return default_price
@@ -798,6 +820,26 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
             tokens = data if isinstance(data, list) else []
             print(f"[DEBUG] Jupiter API returned {len(tokens)} token(s)")
             
+            # Log first few tokens for debugging
+            for i, token in enumerate(tokens[:10], 1):
+                token_id = token.get("id") or token.get("address", "N/A")
+                token_symbol = token.get("symbol", "UNKNOWN")
+                token_mcap = token.get("mcap") or token.get("fdv") or token.get("marketCap") or 0
+                try:
+                    mcap_val = float(token_mcap) if token_mcap else 0
+                    print(f"[DEBUG]   {i}. {token_symbol} ({token_id[:8]}...): mcap=${mcap_val:,.0f}")
+                except:
+                    print(f"[DEBUG]   {i}. {token_symbol} ({token_id[:8]}...): mcap=N/A")
+            
+            # Check if specific tokens are in the response (for debugging)
+            target_tokens = ["3k29upUrDXNF3cuRYArqUKw8AtUNWSqbfZfRvB6fBAGS", "GLBV9FAMhULQpD6iQMGBSchD9s1Hdzd79VqetVjgpump"]
+            for target_id in target_tokens:
+                found = any((token.get("id") or token.get("address", "")) == target_id for token in tokens)
+                if found:
+                    print(f"[DEBUG] ✅ Target token {target_id[:8]}... DITEMUKAN di Jupiter API response!")
+                else:
+                    print(f"[DEBUG] ❌ Target token {target_id[:8]}... TIDAK DITEMUKAN di Jupiter API response")
+            
             if not tokens:
                 return []
             
@@ -817,6 +859,9 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                     # Get token metadata
                     token_name = token.get("name", "Unknown")
                     token_symbol = token.get("symbol", "UNKNOWN")
+                    
+                    # Log token being processed
+                    print(f"[DEBUG] Processing token: {token_symbol} ({token_address[:8]}...)")
                     
                     # Get market cap from token data (toptraded uses "mcap" or "fdv")
                     market_cap = None
@@ -885,13 +930,24 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                     
                     total_fees_sol = total_fees_usd / sol_price_usd if sol_price_usd and total_fees_usd > 0 else 0
                     
-                    # Check criteria
+                    # Check criteria with detailed logging
                     market_cap_ok = market_cap and market_cap >= BOT_CALL_MIN_MARKET_CAP and market_cap <= BOT_CALL_MAX_MARKET_CAP
                     fees_ok = total_fees_sol >= BOT_CALL_MIN_FEES_SOL
                     price_change_1h_ok = price_change_1h is not None and price_change_1h >= BOT_CALL_MIN_PRICE_CHANGE_1H
                     
+                    # Log filter check results
+                    print(f"[DEBUG]   {token_symbol} filter check:")
+                    mcap_str = f"${market_cap:,.0f}" if market_cap else "$0"
+                    print(f"    - Market cap: {mcap_str} (min: ${BOT_CALL_MIN_MARKET_CAP:,.0f}, max: ${BOT_CALL_MAX_MARKET_CAP:,.0f}) -> {'✅' if market_cap_ok else '❌'}")
+                    print(f"    - Fees: {total_fees_sol:.2f} SOL (min: {BOT_CALL_MIN_FEES_SOL} SOL) -> {'✅' if fees_ok else '❌'}")
+                    price_change_str = f"{price_change_1h:.2f}%" if price_change_1h is not None else "N/A"
+                    print(f"    - Price change 1h: {price_change_str} (min: {BOT_CALL_MIN_PRICE_CHANGE_1H}%) -> {'✅' if price_change_1h_ok else '❌'}")
+                    
                     if not (market_cap_ok and fees_ok and price_change_1h_ok):
+                        print(f"[DEBUG]   {token_symbol} TIDAK MEMENUHI kriteria, skip")
                         continue
+                    
+                    print(f"[DEBUG]   {token_symbol} MEMENUHI semua kriteria filter, lanjut cek Meteora pools...")
                     
                     # Get additional data
                     price_usd = token.get("usdPrice") or token.get("price") or None
@@ -927,38 +983,29 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                             except (ValueError, TypeError):
                                 price_change_24h = None
                     
-                    # Check if token is new (created within last 2 hours)
+                    # Get created_at for reference (tidak digunakan untuk filter)
                     created_at = token.get("createdAt") or token.get("created_at") or token.get("firstPool", {}).get("createdAt")
-                    is_new = True
-                    if created_at:
-                        try:
-                            # Handle ISO string format (e.g., "2025-01-29T23:29:10Z")
-                            if isinstance(created_at, str):
-                                if created_at.isdigit():
-                                    # Timestamp string
-                                    created_ts = int(created_at)
-                                else:
-                                    # ISO format string - parse it
-                                    try:
-                                        dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                                        created_ts = dt.timestamp()
-                                    except:
-                                        created_ts = 0
-                            elif isinstance(created_at, (int, float)):
-                                created_ts = created_at if created_at > 1e10 else created_at * 1000
-                            else:
-                                created_ts = 0
-                            
-                            if created_ts > 0:
-                                created_ts_seconds = created_ts / 1000 if created_ts > 1e10 else created_ts
-                                age_hours = (now - created_ts_seconds) / 3600
-                                if age_hours > 2:
-                                    is_new = False
-                        except (ValueError, TypeError):
-                            pass
                     
-                    # Skip old tokens unless fees are very high
-                    if not is_new and total_fees_sol < BOT_CALL_MIN_FEES_SOL * 2:
+                    # Check if token has Meteora pools with min liquidity 500 USD (REQUIRED for bot call notification)
+                    try:
+                        print(f"[DEBUG]   {token_symbol}: Checking Meteora pools for {token_address[:8]}...")
+                        meteora_pools = fetch_meteora_pools(token_address)
+                        if not meteora_pools or len(meteora_pools) == 0:
+                            print(f"[DEBUG]   {token_symbol}: ❌ Tidak punya pool di Meteora, skip")
+                            continue
+                        
+                        # Check if any pool has minimum liquidity of 500 USD
+                        max_liq = max([pool.get('raw_liq', 0) for pool in meteora_pools], default=0)
+                        if max_liq < 500:
+                            print(f"[DEBUG]   {token_symbol}: ❌ Punya {len(meteora_pools)} pool di Meteora, tapi max liquidity hanya ${max_liq:.2f} (< $500), skip")
+                            continue
+                        
+                        print(f"[DEBUG]   {token_symbol}: ✅ Punya {len(meteora_pools)} pool di Meteora dengan max liquidity ${max_liq:.2f} (>= $500), QUALIFY!")
+                    except Exception as e:
+                        # Jika error saat fetch pools, skip token ini (anggap tidak punya pool)
+                        print(f"[DEBUG]   {token_symbol}: ❌ Error checking Meteora pools: {e}, skip")
+                        import traceback
+                        traceback.print_exc()
                         continue
                     
                     qualifying_tokens.append({
@@ -1099,68 +1146,60 @@ async def send_bot_call_notification(token_data: Dict[str, object]):
                 await interaction.response.defer(ephemeral=True)
                 
                 try:
-                    # Get LP Calls channel
+                    # Get LP Chat channel (untuk buat thread)
+                    lp_chat_channel = bot.get_channel(THREAD_SCAN_CHANNEL_ID)
+                    if not lp_chat_channel:
+                        await interaction.followup.send("❌ LP Chat channel tidak ditemukan!", ephemeral=True)
+                        return
+                    
+                    # Get LP Calls channel (untuk kirim embed info)
                     lp_calls_channel = bot.get_channel(ALLOWED_CHANNEL_ID)
                     if not lp_calls_channel:
                         await interaction.followup.send("❌ LP Calls channel tidak ditemukan!", ephemeral=True)
                         return
                     
-                    # Create thread name
-                    thread_name = f"{self.token_symbol}-{self.token_name[:20]}" if len(self.token_name) > 20 else f"{self.token_symbol}-{self.token_name}"
-                    thread_name = thread_name.replace(" ", "").replace("/", "-")[:100]  # Discord limit
-                    
-                    # Create thread
-                    thread = await lp_calls_channel.create_thread(
-                        name=thread_name,
-                        type=discord.ChannelType.public_thread,
-                        reason=f"Thread created by {interaction.user} via bot call button",
-                        auto_archive_duration=60,
-                    )
-                    
-                    # Track thread for auto-archive
-                    threads_to_archive[thread.id] = time.time()
-                    
-                    # Fetch Meteora pools
+                    # Fetch Meteora pools first untuk dapat pair name
+                    pools = []
                     try:
                         pools = fetch_meteora_pools(self.token_address)
                         pools.sort(key=lambda x: x['raw_liq'], reverse=True)
-                        
-                        if pools:
-                            desc = f"Found {len(pools)} Meteora DLMM pool untuk `{self.token_address}`\n\n"
-                            for i, p in enumerate(pools[:10], 1):
-                                link = f"https://app.meteora.ag/dlmm/{p['address']}"
-                                desc += f"{i}. [{p['pair']}]({link}) {p['bin']} - LQ: {p['liq']}\n"
-                            
-                            pool_embed = discord.Embed(
-                                title=f"Meteora DLMM Pools — {thread_name}",
-                                description=desc,
-                                color=0x00ff00
-                            )
-                            await thread.send(embed=pool_embed)
                     except Exception as e:
                         print(f"[DEBUG] Error fetching Meteora pools: {e}")
                     
-                    # Send contract info embed
+                    # Create thread name (mirip !call)
+                    if pools:
+                        top_pool = pools[0]
+                        pair_name = top_pool['pair'].replace(" ", "")
+                        thread_name = f"{pair_name}"
+                    else:
+                        # Fallback jika pools tidak ditemukan
+                        thread_name = f"{self.token_symbol}-{self.token_name[:20]}" if len(self.token_name) > 20 else f"{self.token_symbol}-{self.token_name}"
+                        thread_name = thread_name.replace(" ", "").replace("/", "-")[:100]  # Discord limit
+                    
+                    # Create thread di LP Chat (mirip !call yang buat thread di ctx.channel)
+                    thread = await lp_chat_channel.create_thread(
+                        name=thread_name,
+                        type=discord.ChannelType.public_thread,
+                        reason=f"Thread created by {interaction.user} via bot call button",
+                        auto_archive_duration=60,  # Discord minimum (akan di-override oleh task 15 menit)
+                    )
+                    
+                    # Track thread untuk auto-archive setelah 15 menit
+                    threads_to_archive[thread.id] = time.time()
+                    print(f"[DEBUG] Thread {thread.id} ditambahkan ke auto-archive queue (15 menit)")
+                    
+                    # Send contract info embed ke thread (sama seperti !call: contract_embed dulu)
                     contract_embed = discord.Embed(
                         title=f"💬 Thread created for `{thread_name}`",
                         description=f"**Contract Address:** `{self.token_address}`",
                         color=0x3498db
                     )
-                    # Get top pool address for Meteora link
-                    meteora_link = "https://app.meteora.ag"
-                    if pools:
-                        top_pool = pools[0]
-                        pool_addr = top_pool.get('address')
-                        if pool_addr:
-                            meteora_link = f"https://app.meteora.ag/dlmm/{pool_addr}"
-                    
                     contract_embed.add_field(
                         name="🔗 Links",
                         value=(
                             f"[🔍 Solscan](https://solscan.io/token/{self.token_address})\n"
                             f"[🪐 Jupiter](https://jup.ag/tokens/{self.token_address})\n"
-                            f"[📊 GMGN](https://gmgn.ai/sol/token/{self.token_address})\n"
-                            f"[🌊 Meteora]({meteora_link})"
+                            f"[📊 GMGN](https://gmgn.ai/sol/token/{self.token_address})"
                         ),
                         inline=False
                     )
@@ -1168,13 +1207,50 @@ async def send_bot_call_notification(token_data: Dict[str, object]):
                     mention_text = f"<@&{MENTION_ROLE_ID}>" if MENTION_ROLE_ID else ""
                     await thread.send(f"{mention_text}", embed=contract_embed)
                     
+                    # Send Meteora pools embed ke thread (setelah contract_embed, sama seperti !call)
+                    if pools:
+                        desc = f"Found {len(pools)} Meteora DLMM pool untuk `{self.token_address}`\n\n"
+                        for i, p in enumerate(pools[:10], 1):
+                            link = f"https://app.meteora.ag/dlmm/{p['address']}"
+                            desc += f"{i}. [{p['pair']}]({link}) {p['bin']} - LQ: {p['liq']}\n"
+                        
+                        pool_embed = discord.Embed(
+                            title=f"Meteora DLMM Pools — {thread_name}",
+                            description=desc,
+                            color=0x00ff00
+                        )
+                        pool_embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+                        await thread.send(embed=pool_embed)
+                    
+                    # Kirim embed info ke LP Calls channel (sama persis seperti !call)
                     thread_link = f"https://discord.com/channels/{interaction.guild.id}/{thread.id}"
+                    top_pool_info = pools[0] if pools else None
+                    
+                    # Build top pool info string (avoid backslash in f-string expression)
+                    if top_pool_info:
+                        top_pool_str = f"**Top Pool:** {top_pool_info['pair']} ({top_pool_info['liq']})"
+                    else:
+                        top_pool_str = "**Top Pool:** N/A"
+                    
+                    info_embed = discord.Embed(
+                        title=f"🧵 {thread_name}",
+                        description=(
+                            f"**Created by:** {interaction.user.mention}\n"
+                            f"**Channel:** {lp_chat_channel.mention}\n"
+                            f"**Token:** `{self.token_address[:8]}...`\n"
+                            f"{top_pool_str}\n\n"
+                            f"[🔗 Open Thread]({thread_link})"
+                        ),
+                        color=0x3498db
+                    )
+                    await lp_calls_channel.send(embed=info_embed)
+                    
                     await interaction.followup.send(
-                        f"✅ Thread berhasil dibuat!\n[🔗 Open Thread]({thread_link})",
+                        f"✅ Thread berhasil dibuat di {lp_chat_channel.mention}!\n[🔗 Open Thread]({thread_link})",
                         ephemeral=True
                     )
                     
-                    print(f"[DEBUG] Thread {thread.id} created by {interaction.user.name} via bot call button")
+                    print(f"[DEBUG] Thread {thread.id} created by {interaction.user.name} via bot call button (in LP Chat, copied to LP Calls)")
                     
                 except discord.Forbidden:
                     await interaction.followup.send("❌ Bot tidak punya izin untuk membuat thread!", ephemeral=True)
@@ -1222,17 +1298,32 @@ async def poll_new_tokens():
             save_bot_call_state()
         
         if not new_tokens:
+            print(f"[DEBUG] No qualifying tokens found after filter checks")
             return
         
-        # Filter out tokens already notified today
-        unnotified_tokens = [
-            token for token in new_tokens
-            if token.get("address") not in bot_call_notified_tokens or 
-               bot_call_notified_tokens.get(token.get("address")) != today
-        ]
+        print(f"[DEBUG] Found {len(new_tokens)} qualifying token(s), checking if already notified...")
+        
+        # Filter out tokens already notified today with detailed logging
+        unnotified_tokens = []
+        for token in new_tokens:
+            token_address = token.get("address")
+            token_symbol = token.get("symbol", "UNKNOWN")
+            
+            if token_address not in bot_call_notified_tokens:
+                print(f"[DEBUG]   {token_symbol} ({token_address[:8]}...) belum pernah di-notifikasi, ✅ tambahkan ke list")
+                unnotified_tokens.append(token)
+            elif bot_call_notified_tokens.get(token_address) != today:
+                notified_date = bot_call_notified_tokens.get(token_address)
+                print(f"[DEBUG]   {token_symbol} ({token_address[:8]}...) sudah di-notifikasi sebelumnya (date: {notified_date}), tapi bukan hari ini ({today}), ✅ tambahkan ke list")
+                unnotified_tokens.append(token)
+            else:
+                print(f"[DEBUG]   {token_symbol} ({token_address[:8]}...) sudah di-notifikasi hari ini, ❌ skip")
         
         if not unnotified_tokens:
+            print(f"[DEBUG] Semua token sudah di-notifikasi hari ini, tidak ada yang perlu di-notifikasi")
             return
+        
+        print(f"[DEBUG] {len(unnotified_tokens)} token(s) perlu di-notifikasi")
         
         # Calculate score for each token (prioritize market cap 60%, fees 40%)
         def calculate_score(token):
@@ -1242,11 +1333,22 @@ async def poll_new_tokens():
             fees_score = (fees_sol / 100) * 0.4
             return market_cap_score + fees_score
         
+        # Log all qualifying tokens before sorting
+        print(f"[DEBUG] All qualifying tokens:")
+        for i, token in enumerate(unnotified_tokens, 1):
+            token_symbol = token.get("symbol", "UNKNOWN")
+            token_address = token.get("address", "N/A")
+            score = calculate_score(token)
+            print(f"  {i}. {token_symbol} ({token_address[:8]}...): score={score:.2f}, mcap=${token.get('market_cap', 0):,.0f}, fees={token.get('total_fees_sol', 0):.2f} SOL")
+        
         # Sort by score and get best token
         unnotified_tokens.sort(key=calculate_score, reverse=True)
         best_token = unnotified_tokens[0]
         
-        print(f"[DEBUG] Selected BEST token: {best_token.get('symbol')} (score: {calculate_score(best_token):.2f}, market cap: ${best_token.get('market_cap', 0):,.0f}, fees: {best_token.get('total_fees_sol', 0):.2f} SOL)")
+        print(f"[DEBUG] ✅ Selected BEST token: {best_token.get('symbol')} ({best_token.get('address', 'N/A')[:8]}...)")
+        print(f"[DEBUG]    Score: {calculate_score(best_token):.2f}")
+        print(f"[DEBUG]    Market cap: ${best_token.get('market_cap', 0):,.0f}")
+        print(f"[DEBUG]    Fees: {best_token.get('total_fees_sol', 0):.2f} SOL")
         
         await send_bot_call_notification(best_token)
         
@@ -2150,10 +2252,31 @@ def fetch_meteora_pools(ca: str, max_retries: int = 3):
                                 liq_str = f"${liq/1000:.1f}K" if liq >= 1000 else f"${liq:.1f}"
                                 bin_step = pool.get('bin_step', 0)
                                 address = pool.get('address', '')
+                                
+                                # Get base fee from pool data
+                                # Use base_fee_percentage directly from API (no conversion)
+                                base_fee = None
+                                if 'base_fee_percentage' in pool:
+                                    base_fee_percentage = pool.get('base_fee_percentage')
+                                    try:
+                                        # Use value directly from API
+                                        if isinstance(base_fee_percentage, (int, float)):
+                                            base_fee = int(base_fee_percentage)
+                                        elif isinstance(base_fee_percentage, str):
+                                            base_fee = int(float(base_fee_percentage))
+                                    except (ValueError, TypeError):
+                                        pass
+                                
+                                # Default to 5 if base_fee not found
+                                if base_fee is None or base_fee == 0:
+                                    base_fee = 5
+                                
+                                # Format: bin_step/base_fee (e.g., "100/1", "100/5")
+                                bin_format = f"{bin_step}/{base_fee}"
 
                                 matching_pools.append({
                                     'pair': pair_name,
-                                    'bin': f"{bin_step}/5",
+                                    'bin': bin_format,
                                     'liq': liq_str,
                                     'raw_liq': liq,
                                     'address': address
