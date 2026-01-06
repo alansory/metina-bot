@@ -12,7 +12,7 @@ import random
 from collections import deque
 from discord import app_commands
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- TOKEN ---
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
@@ -69,6 +69,30 @@ metadao_notification_state: Dict[str, Dict[str, object]] = {}
 THREAD_AUTO_ARCHIVE_MINUTES = 15  # Auto-archive thread setelah 15 menit
 threads_to_archive: Dict[int, float] = {}  # {thread_id: created_timestamp}
 AUTO_SCAN_OLD_THREADS_ON_STARTUP = os.getenv("AUTO_SCAN_OLD_THREADS", "false").lower() == "true"  # Set ke "true" untuk enable auto-scan saat startup
+
+# ============================================================================
+# --- FITUR BARU: TOKEN LAUNCH TRACKER (DAMM V2) ---
+# ============================================================================
+# Monitor token yang akan launch dan detect ketika pool DAMM v2 tersedia
+LAUNCH_TRACKER_ENABLED = os.getenv("LAUNCH_TRACKER_ENABLED", "true").lower() == "true"
+LAUNCH_TRACKER_POLL_INTERVAL_SEC = int(os.getenv("LAUNCH_TRACKER_POLL_INTERVAL", "10"))  # Poll setiap 10 detik
+LAUNCH_TRACKER_STATE_FILE = "launch_tracker_state.json"
+LAUNCH_TRACKER_CHANNEL_ID = int(os.getenv("LAUNCH_TRACKER_CHANNEL_ID", str(DAMM_CHANNEL_ID))) if DAMM_CHANNEL_ID else None  # Default ke DAMM channel
+
+# State untuk launch tracker
+launch_tracker_tokens: Dict[str, Dict] = {}  # {token_address: {name, symbol, added_at, added_by, status}}
+launch_detected_pools: Dict[str, str] = {}  # {token_address: pool_address} - untuk track yang sudah detect
+
+# ============================================================================
+# --- FITUR BARU: ICO TRACKER (DAILY + 1 HOUR REMINDER) ---
+# ============================================================================
+ICO_TRACKER_ENABLED = os.getenv("ICO_TRACKER_ENABLED", "true").lower() == "true"
+ICO_TRACKER_STATE_FILE = "ico_tracker_state.json"
+ICO_TRACKER_CHANNEL_ID = int(os.getenv("ICO_TRACKER_CHANNEL_ID", str(DAMM_CHANNEL_ID))) if DAMM_CHANNEL_ID else None
+
+# State untuk ICO tracker
+# Format: {ico_id: {name, token_symbol, end_time, target, committed, url, daily_notified_dates, hour_reminder_sent, ...}}
+ico_tracker_list: Dict[str, Dict] = {}
 
 async def wait_for_rate_limit():
     """Wait if we're hitting rate limits, implements token bucket pattern."""
@@ -268,6 +292,54 @@ def save_hype_state():
     except Exception as e:
         print(f"[ERROR] Failed to save hype state: {e}")
 
+# --- LAUNCH TRACKER LOAD/SAVE ---
+def load_launch_tracker_state():
+    """Load launch tracker state from file."""
+    global launch_tracker_tokens, launch_detected_pools
+    try:
+        if os.path.exists(LAUNCH_TRACKER_STATE_FILE):
+            with open(LAUNCH_TRACKER_STATE_FILE, 'r') as f:
+                data = json.load(f)
+                launch_tracker_tokens = data.get("tokens", {})
+                launch_detected_pools = data.get("detected_pools", {})
+            print(f"[LAUNCH_TRACKER] Loaded {len(launch_tracker_tokens)} tracked token(s), {len(launch_detected_pools)} detected pool(s)")
+    except Exception as e:
+        print(f"[ERROR] Failed to load launch tracker state: {e}")
+        launch_tracker_tokens = {}
+        launch_detected_pools = {}
+
+def save_launch_tracker_state():
+    """Save launch tracker state to file."""
+    try:
+        with open(LAUNCH_TRACKER_STATE_FILE, 'w') as f:
+            json.dump({
+                "tokens": launch_tracker_tokens,
+                "detected_pools": launch_detected_pools
+            }, f, indent=4)
+    except Exception as e:
+        print(f"[ERROR] Failed to save launch tracker state: {e}")
+
+# --- ICO TRACKER LOAD/SAVE ---
+def load_ico_tracker_state():
+    """Load ICO tracker state from file."""
+    global ico_tracker_list
+    try:
+        if os.path.exists(ICO_TRACKER_STATE_FILE):
+            with open(ICO_TRACKER_STATE_FILE, 'r') as f:
+                ico_tracker_list = json.load(f)
+            print(f"[ICO_TRACKER] Loaded {len(ico_tracker_list)} tracked ICO(s)")
+    except Exception as e:
+        print(f"[ERROR] Failed to load ICO tracker state: {e}")
+        ico_tracker_list = {}
+
+def save_ico_tracker_state():
+    """Save ICO tracker state to file."""
+    try:
+        with open(ICO_TRACKER_STATE_FILE, 'w') as f:
+            json.dump(ico_tracker_list, f, indent=4)
+    except Exception as e:
+        print(f"[ERROR] Failed to save ICO tracker state: {e}")
+
 # Trading State
 TRADING_POSITIONS_FILE = "trading_positions.json"
 TRADING_HISTORY_FILE = "trading_history.json"
@@ -405,6 +477,88 @@ async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int, slip
     except Exception as e:
         print(f"[TRADING] Jupiter quote failed: {e}")
         return None
+
+# SOL mint address
+SOL_MINT = "So11111111111111111111111111111111111111112"
+
+async def check_jupiter_tradeable(token_address: str, test_amount_sol: float = 0.01) -> Dict:
+    """
+    Check if token is tradeable on Jupiter.
+    Returns: {
+        "tradeable": bool,
+        "quote": quote_data or None,
+        "out_amount": float (token amount),
+        "price_impact": float (percentage),
+        "routes": int (number of routes)
+    }
+    """
+    global http_session
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    result = {
+        "tradeable": False,
+        "quote": None,
+        "out_amount": 0,
+        "price_impact": 0,
+        "routes": 0,
+        "error": None
+    }
+    
+    try:
+        # Convert SOL to lamports (1 SOL = 1e9 lamports)
+        amount_lamports = int(test_amount_sol * 1_000_000_000)
+        
+        url = "https://quote-api.jup.ag/v6/quote"
+        params = {
+            "inputMint": SOL_MINT,
+            "outputMint": token_address,
+            "amount": str(amount_lamports),
+            "slippageBps": 500,  # 5% slippage for checking
+            "onlyDirectRoutes": "false",
+            "asLegacyTransaction": "false",
+        }
+        
+        async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status == 200:
+                quote = await response.json()
+                
+                # Check if we got a valid quote
+                out_amount = quote.get("outAmount")
+                if out_amount and int(out_amount) > 0:
+                    result["tradeable"] = True
+                    result["quote"] = quote
+                    result["out_amount"] = int(out_amount)
+                    
+                    # Get price impact
+                    price_impact = quote.get("priceImpactPct")
+                    if price_impact:
+                        try:
+                            result["price_impact"] = float(price_impact) * 100  # Convert to percentage
+                        except:
+                            pass
+                    
+                    # Count routes
+                    route_plan = quote.get("routePlan", [])
+                    result["routes"] = len(route_plan)
+                    
+                    print(f"[JUPITER] ✅ Token tradeable! Out: {out_amount}, Impact: {result['price_impact']:.2f}%, Routes: {result['routes']}")
+                else:
+                    result["error"] = "No output amount"
+                    print(f"[JUPITER] ❌ Token not tradeable - no output amount")
+            else:
+                error_text = await response.text()
+                result["error"] = f"HTTP {response.status}"
+                print(f"[JUPITER] ❌ Quote error: {response.status} - {error_text[:100]}")
+                
+    except asyncio.TimeoutError:
+        result["error"] = "Timeout"
+        print(f"[JUPITER] ❌ Quote timeout for {token_address[:8]}...")
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[JUPITER] ❌ Quote failed: {e}")
+    
+    return result
 
 async def execute_jupiter_swap(quote: Dict) -> Optional[str]:
     """Execute swap via Jupiter API. Returns transaction signature if successful."""
@@ -983,45 +1137,54 @@ def token_meets_hype_criteria(hype_data: Dict) -> Tuple[bool, List[str]]:
     return passed, reasons
 
 async def scan_for_hype_tokens() -> List[Dict]:
-    """Scan for tokens that meet hype criteria."""
+    """Scan for tokens that meet hype criteria. Optimized for speed."""
     global http_session
     if not http_session:
         http_session = aiohttp.ClientSession()
     
     qualifying_tokens = []
+    scanned_count = 0
     
     try:
+        print("[HYPE] 🔍 Starting token scan...")
+        
         # Method 1: Scan DexScreener boosted tokens
         boosted = await fetch_trending_tokens_dexscreener()
+        print(f"[HYPE] Got {len(boosted)} from boosted/trending")
         
         # Method 2: Get token profiles with recent activity
-        # DexScreener token profiles API
         profiles_url = "https://api.dexscreener.com/token-profiles/latest/v1"
         try:
-            async with http_session.get(profiles_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            async with http_session.get(profiles_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     profiles = await response.json()
-                    for profile in profiles[:30]:  # Limit
+                    existing_addrs = {t.get("address") for t in boosted}
+                    for profile in profiles[:20]:  # Reduced limit
                         if profile.get("chainId") == "solana":
                             token_addr = profile.get("tokenAddress")
-                            if token_addr and token_addr not in [t.get("address") for t in boosted]:
+                            if token_addr and token_addr not in existing_addrs:
                                 boosted.append({
                                     "address": token_addr,
                                     "source": "dexscreener_profile"
                                 })
+                    print(f"[HYPE] Added {len([p for p in profiles[:20] if p.get('chainId') == 'solana'])} from profiles")
+        except asyncio.TimeoutError:
+            print("[HYPE] ⚠️ Profiles API timeout, continuing...")
         except Exception as e:
-            print(f"[HYPE] Error fetching profiles: {e}")
+            print(f"[HYPE] ⚠️ Profiles fetch error: {e}")
         
-        print(f"[HYPE] Scanning {len(boosted)} potential tokens...")
+        total_to_scan = min(len(boosted), 15)  # Limit to 15 for faster response
+        print(f"[HYPE] Scanning {total_to_scan} tokens...")
         
         # Check each token
-        for token_info in boosted[:20]:  # Limit to prevent rate limiting
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        for token_info in boosted[:total_to_scan]:
             token_address = token_info.get("address")
             if not token_address:
                 continue
             
             # Skip if already traded today
-            today = datetime.now().strftime("%Y-%m-%d")
             if hype_traded_tokens.get(token_address) == today:
                 continue
             
@@ -1029,8 +1192,21 @@ async def scan_for_hype_tokens() -> List[Dict]:
             if token_address in active_positions:
                 continue
             
-            # Get detailed hype data
-            hype_data = await get_token_hype_data(token_address)
+            scanned_count += 1
+            
+            # Get detailed hype data with timeout
+            try:
+                hype_data = await asyncio.wait_for(
+                    get_token_hype_data(token_address),
+                    timeout=8.0  # 8 second timeout per token
+                )
+            except asyncio.TimeoutError:
+                print(f"[HYPE] ⚠️ Timeout fetching {token_address[:8]}...")
+                continue
+            except Exception as e:
+                print(f"[HYPE] ⚠️ Error fetching {token_address[:8]}...: {e}")
+                continue
+            
             if not hype_data:
                 continue
             
@@ -1041,22 +1217,25 @@ async def scan_for_hype_tokens() -> List[Dict]:
             
             if passed:
                 print(f"[HYPE] ✅ {symbol} QUALIFIES! Score: {hype_data.get('hype_score', 0)}")
-                print(f"       Volume 5m: ${hype_data.get('volume_5m', 0):,.0f}")
-                print(f"       Txns 5m: {hype_data.get('txns_5m', 0)} (buys: {hype_data.get('buys_5m', 0)})")
-                print(f"       Price 5m: {hype_data.get('price_change_5m', 0):+.1f}%")
+                print(f"       CA: {token_address}")
+                print(f"       🔗 https://gmgn.ai/sol/token/{token_address}")
                 qualifying_tokens.append(hype_data)
             else:
-                if hype_data.get("volume_5m", 0) >= 10000:  # Only log tokens with some activity
-                    print(f"[HYPE] ❌ {symbol} failed: {', '.join(reasons[:2])}")
+                vol_5m = hype_data.get("volume_5m", 0)
+                if vol_5m >= 10000:  # Only log tokens with some activity
+                    print(f"[HYPE] ❌ {symbol} (vol=${vol_5m:,.0f}): {reasons[0] if reasons else 'unknown'}")
+                    print(f"       CA: {token_address} | https://gmgn.ai/sol/token/{token_address}")
             
-            # Small delay to avoid rate limiting
-            await asyncio.sleep(0.5)
+            # Minimal delay
+            await asyncio.sleep(0.2)
         
         # Sort by hype score
         qualifying_tokens.sort(key=lambda x: x.get("hype_score", 0), reverse=True)
         
+        print(f"[HYPE] ✅ Scan complete: {scanned_count} scanned, {len(qualifying_tokens)} qualified")
+        
     except Exception as e:
-        print(f"[HYPE] Error in scan_for_hype_tokens: {e}")
+        print(f"[HYPE] ❌ Error in scan: {e}")
         import traceback
         traceback.print_exc()
     
@@ -1493,45 +1672,124 @@ async def fetch_token_metadata(mint: str) -> Dict[str, Optional[object]]:
     return metadata
 
 def _extract_metadao_items(html: str) -> List[Dict[str, object]]:
-    """Extract MetaDAO launch data blob from rendered HTML."""
+    """Extract MetaDAO launch data blob from rendered HTML.
+    Supports multiple parsing methods for different page structures.
+    """
+    items = []
+    
+    # Method 1: Try Next.js __NEXT_DATA__ format
+    next_data_marker = '<script id="__NEXT_DATA__" type="application/json">'
+    next_start = html.find(next_data_marker)
+    if next_start != -1:
+        next_start += len(next_data_marker)
+        next_end = html.find('</script>', next_start)
+        if next_end != -1:
+            try:
+                next_data = json.loads(html[next_start:next_end])
+                # Try different paths where projects data might be
+                props = next_data.get("props", {}).get("pageProps", {})
+                
+                # Check common data locations
+                for key in ["projects", "items", "launches", "raises", "fundraises", "data"]:
+                    if key in props:
+                        data = props[key]
+                        if isinstance(data, list):
+                            items.extend(data)
+                            print(f"[DEBUG] MetaDAO: Found {len(data)} items via Next.js __NEXT_DATA__ ({key})")
+                        elif isinstance(data, dict) and "items" in data:
+                            items.extend(data["items"])
+                            print(f"[DEBUG] MetaDAO: Found {len(data['items'])} items via Next.js ({key}.items)")
+                
+                # Also check dehydratedState for React Query
+                dehydrated = props.get("dehydratedState", {}).get("queries", [])
+                for query in dehydrated:
+                    state = query.get("state", {}).get("data", {})
+                    if isinstance(state, dict):
+                        for key in ["items", "projects", "launches"]:
+                            if key in state and isinstance(state[key], list):
+                                items.extend(state[key])
+                                print(f"[DEBUG] MetaDAO: Found {len(state[key])} items via dehydratedState")
+                    elif isinstance(state, list):
+                        items.extend(state)
+                        print(f"[DEBUG] MetaDAO: Found {len(state)} items via dehydratedState (list)")
+                
+                if items:
+                    return items
+            except json.JSONDecodeError as e:
+                print(f"[DEBUG] MetaDAO: Failed to parse __NEXT_DATA__: {e}")
+    
+    # Method 2: Try direct JSON marker {"items":[
     marker = '{"items":['
     start = html.find(marker)
-    if start == -1:
-        return []
-    # Find matching closing brace for the JSON object
-    depth = 0
-    in_string = False
-    escape = False
-    end = None
-    for idx in range(start, len(html)):
-        ch = html[idx]
-        if in_string:
-            if ch == '"' and not escape:
-                in_string = False
-            escape = (ch == '\\' and not escape)
-            continue
-        if ch == '"':
-            in_string = True
-            escape = False
-            continue
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0:
-                end = idx + 1
-                break
-    if end is None:
-        return []
-    payload = html[start:end]
-    try:
-        data = json.loads(payload)
-        items = data.get("items", [])
-        if isinstance(items, list):
-            return items
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] Failed to decode MetaDAO payload: {e}")
-    return []
+    if start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        end = None
+        for idx in range(start, len(html)):
+            ch = html[idx]
+            if in_string:
+                if ch == '"' and not escape:
+                    in_string = False
+                escape = (ch == '\\' and not escape)
+                continue
+            if ch == '"':
+                in_string = True
+                escape = False
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end = idx + 1
+                    break
+        if end is not None:
+            payload = html[start:end]
+            try:
+                data = json.loads(payload)
+                result = data.get("items", [])
+                if isinstance(result, list) and result:
+                    print(f"[DEBUG] MetaDAO: Found {len(result)} items via direct marker")
+                    return result
+            except json.JSONDecodeError as e:
+                print(f"[DEBUG] MetaDAO: Failed to decode direct payload: {e}")
+    
+    # Method 3: Try to find any JSON array with project-like data
+    # Look for patterns like "fundraise" or "timeRemaining" in JSON
+    for pattern in ['"fundraise"', '"timeRemaining"', '"organizationSlug"', '"minimumRaise"']:
+        idx = html.find(pattern)
+        if idx != -1:
+            # Try to find the enclosing array/object
+            # Look backwards for array start
+            array_start = html.rfind('[', max(0, idx - 5000), idx)
+            if array_start != -1:
+                # Find matching end
+                depth = 0
+                end = None
+                for i in range(array_start, min(len(html), array_start + 50000)):
+                    if html[i] == '[':
+                        depth += 1
+                    elif html[i] == ']':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                if end:
+                    try:
+                        data = json.loads(html[array_start:end])
+                        if isinstance(data, list) and len(data) > 0:
+                            # Check if it looks like project data
+                            first = data[0]
+                            if isinstance(first, dict) and any(k in first for k in ["name", "id", "timeRemaining", "organizationSlug"]):
+                                print(f"[DEBUG] MetaDAO: Found {len(data)} items via pattern search")
+                                return data
+                    except json.JSONDecodeError:
+                        pass
+            break  # Only try the first pattern found
+    
+    print(f"[DEBUG] MetaDAO: No items found in HTML (length: {len(html)})")
+    return items
 
 def _format_usd_short(value: Optional[float]) -> str:
     if value is None:
@@ -1555,17 +1813,72 @@ def _metadao_amount_to_usd(value: Optional[int]) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-async def fetch_metadao_launches() -> List[Dict[str, object]]:
+async def fetch_metadao_launches(max_retries: int = 3) -> List[Dict[str, object]]:
     """Fetch active MetaDAO launches with remaining time."""
     global http_session
     if not http_session:
         http_session = aiohttp.ClientSession()
-    try:
-        async with http_session.get(METADAO_PROJECTS_URL, timeout=aiohttp.ClientTimeout(total=20)) as response:
-            response.raise_for_status()
-            html = await response.text()
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch MetaDAO projects: {e}")
+    
+    # Headers untuk menghindari rate limiting (seperti browser biasa)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Cache-Control": "max-age=0",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    
+    html = None
+    
+    # Retry logic dengan exponential backoff
+    for attempt in range(max_retries):
+        try:
+            async with http_session.get(
+                METADAO_PROJECTS_URL, 
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                
+                # Handle rate limiting (429)
+                if response.status == 429:
+                    retry_after = int(response.headers.get('Retry-After', 60))
+                    wait_time = min(retry_after, 120) * (attempt + 1)  # Exponential backoff
+                    print(f"[METADAO] Rate limited (429) - waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    await asyncio.sleep(wait_time)
+                    continue
+                
+                response.raise_for_status()
+                html = await response.text()
+                break  # Success, exit retry loop
+                
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429 and attempt < max_retries - 1:
+                wait_time = 30 * (attempt + 1)
+                print(f"[METADAO] Rate limited - waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                await asyncio.sleep(wait_time)
+                continue
+            print(f"[ERROR] Failed to fetch MetaDAO projects (HTTP {e.status}): {e}")
+            return []
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                wait_time = 10 * (attempt + 1)
+                print(f"[METADAO] Timeout - retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+                continue
+            print(f"[ERROR] MetaDAO request timeout after {max_retries} attempts")
+            return []
+        except Exception as e:
+            print(f"[ERROR] Failed to fetch MetaDAO projects: {e}")
+            return []
+    
+    if not html:
+        print(f"[ERROR] Failed to fetch MetaDAO HTML after {max_retries} attempts")
         return []
 
     items = _extract_metadao_items(html)
@@ -3394,6 +3707,24 @@ async def on_ready():
             print("[HYPE] Hype trading DISABLED - set HYPE_TRADING_ENABLED=true to enable")
     else:
         print("[TRADING] Trading bot DISABLED - set TRADING_ENABLED=true to enable")
+    
+    # Start launch tracker task
+    if LAUNCH_TRACKER_ENABLED:
+        if not poll_token_launches.is_running():
+            poll_token_launches.start()
+            print(f"[LAUNCH_TRACKER] Started (poll every {LAUNCH_TRACKER_POLL_INTERVAL_SEC}s)")
+            print(f"[LAUNCH_TRACKER] Tracking {len(launch_tracker_tokens)} token(s)")
+    else:
+        print("[LAUNCH_TRACKER] DISABLED - set LAUNCH_TRACKER_ENABLED=true to enable")
+    
+    # Start ICO tracker task
+    if ICO_TRACKER_ENABLED:
+        if not poll_ico_tracker.is_running():
+            poll_ico_tracker.start()
+            print(f"[ICO_TRACKER] Started (check every 30 minutes)")
+            print(f"[ICO_TRACKER] Tracking {len(ico_tracker_list)} ICO(s)")
+    else:
+        print("[ICO_TRACKER] DISABLED - set ICO_TRACKER_ENABLED=true to enable")
 
 # --- EVENT: MEMBER BARU JOIN ---
 @bot.event
@@ -3627,6 +3958,585 @@ def fetch_meteora_pools(ca: str, max_retries: int = 3):
     
     # Should not reach here, but just in case
     raise Exception("Gagal fetch pools setelah beberapa percobaan. Coba lagi nanti.")
+
+# ============================================================================
+# --- DAMM V2 POOL TRACKER FUNCTIONS ---
+# ============================================================================
+
+async def fetch_dammv2_pools(token_address: str) -> List[Dict]:
+    """
+    Fetch DAMM v2 pools for a token from Meteora API.
+    Returns list of pools with their addresses.
+    """
+    global http_session
+    
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    pools = []
+    
+    try:
+        # Try DAMM v2 API endpoint (Dynamic AMM v2)
+        # Meteora DAMM v2 API: https://amm-v2.meteora.ag/pools
+        dammv2_url = f"https://amm-v2.meteora.ag/pools?token={token_address}"
+        
+        async with http_session.get(dammv2_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status == 200:
+                data = await response.json()
+                
+                # Handle different response formats
+                if isinstance(data, list):
+                    for pool in data:
+                        pool_address = pool.get('pool_address') or pool.get('address') or pool.get('id')
+                        if pool_address:
+                            pools.append({
+                                "address": pool_address,
+                                "type": "dammv2",
+                                "token_a": pool.get('token_a_mint') or pool.get('tokenAMint'),
+                                "token_b": pool.get('token_b_mint') or pool.get('tokenBMint'),
+                                "liquidity": pool.get('liquidity') or pool.get('tvl', 0),
+                                "volume_24h": pool.get('volume_24h') or pool.get('trade_volume_24h', 0),
+                                "fee": pool.get('fee') or pool.get('fees_24h', 0),
+                                "created_at": pool.get('created_at') or pool.get('pool_created_at'),
+                            })
+                elif isinstance(data, dict):
+                    # Single pool or nested structure
+                    if 'pools' in data:
+                        for pool in data['pools']:
+                            pool_address = pool.get('pool_address') or pool.get('address') or pool.get('id')
+                            if pool_address:
+                                pools.append({
+                                    "address": pool_address,
+                                    "type": "dammv2",
+                                    "token_a": pool.get('token_a_mint') or pool.get('tokenAMint'),
+                                    "token_b": pool.get('token_b_mint') or pool.get('tokenBMint'),
+                                    "liquidity": pool.get('liquidity') or pool.get('tvl', 0),
+                                    "volume_24h": pool.get('volume_24h', 0),
+                                    "fee": pool.get('fee', 0),
+                                    "created_at": pool.get('created_at'),
+                                })
+                    elif 'pool_address' in data or 'address' in data:
+                        pool_address = data.get('pool_address') or data.get('address')
+                        pools.append({
+                            "address": pool_address,
+                            "type": "dammv2",
+                            "token_a": data.get('token_a_mint'),
+                            "token_b": data.get('token_b_mint'),
+                            "liquidity": data.get('liquidity', 0),
+                            "volume_24h": data.get('volume_24h', 0),
+                            "fee": data.get('fee', 0),
+                            "created_at": data.get('created_at'),
+                        })
+                
+                if pools:
+                    print(f"[DAMM_V2] Found {len(pools)} DAMM v2 pool(s) for {token_address[:8]}...")
+                    return pools
+        
+        # Fallback: Try alternative endpoint (pool search by mint)
+        search_url = f"https://amm-v2.meteora.ag/pair/all?search_term={token_address}"
+        
+        async with http_session.get(search_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status == 200:
+                data = await response.json()
+                if isinstance(data, list):
+                    for pool in data:
+                        mint_x = (pool.get('mint_x') or pool.get('token_a_mint') or '').lower()
+                        mint_y = (pool.get('mint_y') or pool.get('token_b_mint') or '').lower()
+                        target_lower = token_address.lower()
+                        
+                        if target_lower in [mint_x, mint_y]:
+                            pool_address = pool.get('address') or pool.get('pool_address')
+                            if pool_address:
+                                pools.append({
+                                    "address": pool_address,
+                                    "type": "dammv2",
+                                    "token_a": pool.get('mint_x') or pool.get('token_a_mint'),
+                                    "token_b": pool.get('mint_y') or pool.get('token_b_mint'),
+                                    "liquidity": pool.get('liquidity', 0),
+                                    "volume_24h": pool.get('trade_volume_24h', 0),
+                                    "fee": pool.get('fees_24h', 0),
+                                    "created_at": pool.get('created_at'),
+                                })
+                
+                if pools:
+                    print(f"[DAMM_V2] Found {len(pools)} pool(s) via search for {token_address[:8]}...")
+                    return pools
+        
+        # Try DLMM API as last resort (might redirect to DAMM v2)
+        dlmm_url = 'https://dlmm-api.meteora.ag/pair/all_by_groups'
+        params = {'search_term': token_address, 'limit': 10}
+        
+        async with http_session.get(dlmm_url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status == 200:
+                data = await response.json()
+                if isinstance(data, dict) and 'groups' in data:
+                    for group in data.get('groups', []):
+                        for pool in group.get('pairs', []):
+                            mint_x = (pool.get('mint_x') or '').lower()
+                            mint_y = (pool.get('mint_y') or '').lower()
+                            target_lower = token_address.lower()
+                            
+                            if target_lower in [mint_x, mint_y]:
+                                pool_address = pool.get('address')
+                                if pool_address:
+                                    pools.append({
+                                        "address": pool_address,
+                                        "type": "dlmm",
+                                        "name": pool.get('name', ''),
+                                        "token_a": pool.get('mint_x'),
+                                        "token_b": pool.get('mint_y'),
+                                        "liquidity": pool.get('liquidity', 0),
+                                        "volume_24h": pool.get('trade_volume_24h', 0),
+                                        "fee": pool.get('fees_24h', 0),
+                                        "bin_step": pool.get('bin_step'),
+                                        "base_fee": pool.get('base_fee_percentage'),
+                                    })
+        
+        return pools
+        
+    except asyncio.TimeoutError:
+        print(f"[DAMM_V2] Timeout fetching pools for {token_address[:8]}...")
+        return []
+    except Exception as e:
+        print(f"[DAMM_V2] Error fetching pools for {token_address[:8]}...: {e}")
+        return []
+
+async def send_launch_notification(token_address: str, token_data: Dict, pools: List[Dict], jupiter_info: Optional[Dict] = None):
+    """Send notification when token pool is detected and tradeable."""
+    
+    channel_id = LAUNCH_TRACKER_CHANNEL_ID or DAMM_CHANNEL_ID or BOT_CALL_CHANNEL_ID
+    if not channel_id:
+        print("[LAUNCH_TRACKER] No channel configured for notifications")
+        return
+    
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        print(f"[LAUNCH_TRACKER] Channel {channel_id} not found")
+        return
+    
+    try:
+        token_name = token_data.get("name", "Unknown")
+        token_symbol = token_data.get("symbol", "UNKNOWN")
+        added_by = token_data.get("added_by", "Unknown")
+        added_at = token_data.get("added_at", "")
+        
+        # Get the best pool (highest liquidity)
+        pools_sorted = sorted(pools, key=lambda x: float(x.get('liquidity', 0) or 0), reverse=True)
+        top_pool = pools_sorted[0] if pools_sorted else None
+        
+        pool_address = top_pool.get("address") if top_pool else None
+        pool_type = top_pool.get("type", "dammv2") if top_pool else "dammv2"
+        liquidity = top_pool.get("liquidity", 0) if top_pool else 0
+        
+        # Format liquidity
+        if liquidity:
+            try:
+                liq_val = float(liquidity)
+                if liq_val >= 1_000_000:
+                    liquidity_str = f"${liq_val/1_000_000:.2f}M"
+                elif liq_val >= 1000:
+                    liquidity_str = f"${liq_val/1000:.2f}K"
+                else:
+                    liquidity_str = f"${liq_val:.2f}"
+            except:
+                liquidity_str = "N/A"
+        else:
+            liquidity_str = "N/A"
+        
+        # Calculate time since added
+        time_diff_str = "Just now"
+        if added_at:
+            try:
+                added_timestamp = datetime.fromisoformat(added_at.replace('Z', '+00:00'))
+                now = datetime.now(added_timestamp.tzinfo) if added_timestamp.tzinfo else datetime.now()
+                diff = now - added_timestamp.replace(tzinfo=None) if not added_timestamp.tzinfo else now - added_timestamp
+                
+                total_seconds = int(diff.total_seconds())
+                if total_seconds < 60:
+                    time_diff_str = f"{total_seconds} detik"
+                elif total_seconds < 3600:
+                    time_diff_str = f"{total_seconds // 60} menit"
+                else:
+                    time_diff_str = f"{total_seconds // 3600} jam {(total_seconds % 3600) // 60} menit"
+            except:
+                pass
+        
+        # Jupiter tradeable status
+        jupiter_status = "✅ Tradeable"
+        jupiter_routes = 0
+        jupiter_impact = 0
+        if jupiter_info:
+            jupiter_routes = jupiter_info.get("routes", 0)
+            jupiter_impact = jupiter_info.get("price_impact", 0)
+            if jupiter_impact > 10:
+                jupiter_status = f"⚠️ High Impact ({jupiter_impact:.1f}%)"
+            elif jupiter_impact > 5:
+                jupiter_status = f"✅ Tradeable ({jupiter_impact:.1f}% impact)"
+            else:
+                jupiter_status = f"✅ Tradeable ({jupiter_routes} routes)"
+        
+        # Create embed
+        embed = discord.Embed(
+            title=f"🚀 TOKEN LAUNCHED! {token_symbol}",
+            description=(
+                f"**{token_name}** (`{token_symbol}`) sudah LIVE!\n\n"
+                f"Pool terdeteksi dalam **{time_diff_str}** setelah tracking dimulai!\n"
+                f"🪐 **Jupiter:** {jupiter_status}"
+            ),
+            color=0x00FF00,  # Green
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(name="💰 Liquidity", value=liquidity_str, inline=True)
+        embed.add_field(name="📊 Pool Type", value=pool_type.upper(), inline=True)
+        embed.add_field(name="⏱️ Detection Time", value=time_diff_str, inline=True)
+        
+        # Jupiter info field
+        if jupiter_info and jupiter_info.get("tradeable"):
+            embed.add_field(
+                name="🪐 Jupiter Swap",
+                value=f"✅ **READY TO TRADE**\nRoutes: {jupiter_routes}\nPrice Impact: {jupiter_impact:.2f}%",
+                inline=True
+            )
+        
+        # Links
+        links = []
+        
+        # Meteora DAMM v2 link (primary)
+        if pool_address:
+            if pool_type == "dlmm":
+                meteora_link = f"[🌊 Meteora DLMM](https://app.meteora.ag/dlmm/{pool_address})"
+            else:
+                meteora_link = f"[🌊 Meteora DAMM v2](https://meteora.ag/dammv2/{pool_address})"
+            links.append(meteora_link)
+        
+        links.extend([
+            f"[🔍 Solscan](https://solscan.io/token/{token_address})",
+            f"[🪐 Jupiter](https://jup.ag/swap/SOL-{token_address})",
+            f"[📊 GMGN](https://gmgn.ai/sol/token/{token_address})",
+            f"[🦅 Birdeye](https://birdeye.so/token/{token_address}?chain=solana)"
+        ])
+        
+        embed.add_field(name="🔗 Links", value="\n".join(links), inline=False)
+        
+        # Pool info
+        if pool_address:
+            embed.add_field(
+                name="📍 Pool Address", 
+                value=f"`{pool_address[:20]}...{pool_address[-8:]}`",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Token: {token_address[:12]}...{token_address[-8:]} | Tracked by: {added_by}")
+        
+        # Add thumbnail (optional - you can add token logo URL if available)
+        # embed.set_thumbnail(url="...")
+        
+        # Mention role if configured
+        mention_text = ""
+        if MENTION_ROLE_ID:
+            mention_text = f"<@&{MENTION_ROLE_ID}> "
+        
+        await channel.send(content=f"{mention_text}🚀 **Token Launch Detected!**", embed=embed)
+        print(f"[LAUNCH_TRACKER] ✅ Sent notification for {token_symbol} ({token_address[:8]}...)")
+        
+    except Exception as e:
+        print(f"[LAUNCH_TRACKER] Error sending notification: {e}")
+        import traceback
+        traceback.print_exc()
+
+# Background task untuk poll token launches
+@tasks.loop(seconds=LAUNCH_TRACKER_POLL_INTERVAL_SEC)
+async def poll_token_launches():
+    """Poll tracked tokens to detect when their NEW pools go live AND tradeable on Jupiter."""
+    global launch_tracker_tokens, launch_detected_pools
+    
+    if not LAUNCH_TRACKER_ENABLED:
+        return
+    
+    if not launch_tracker_tokens:
+        return
+    
+    print(f"[LAUNCH_TRACKER] Scanning {len(launch_tracker_tokens)} tracked token(s)...")
+    
+    for token_address, token_data in list(launch_tracker_tokens.items()):
+        try:
+            # Skip if already notified for new pool
+            if token_data.get("status") == "launched":
+                continue
+            
+            # Skip if status is not "tracking"
+            if token_data.get("status") != "tracking":
+                continue
+            
+            token_symbol = token_data.get("symbol", "UNKNOWN")
+            
+            # Step 1: Check if tradeable on Jupiter first (faster check)
+            jupiter_check = await check_jupiter_tradeable(token_address)
+            
+            if not jupiter_check.get("tradeable"):
+                # Not tradeable yet, skip pool check
+                print(f"[LAUNCH_TRACKER] {token_symbol}: Not tradeable on Jupiter yet")
+                await asyncio.sleep(1)
+                continue
+            
+            print(f"[LAUNCH_TRACKER] {token_symbol}: ✅ Tradeable on Jupiter! Checking pools...")
+            
+            # Step 2: Fetch pools for this token
+            pools = await fetch_dammv2_pools(token_address)
+            
+            if pools:
+                # Get existing pool addresses that were saved when tracking started
+                existing_pools = set(token_data.get("existing_pools", []))
+                
+                # Find NEW pools (not in existing_pools)
+                new_pools = []
+                for pool in pools:
+                    pool_address = pool.get("address")
+                    if pool_address and pool_address not in existing_pools:
+                        new_pools.append(pool)
+                
+                if new_pools:
+                    # NEW pool found AND tradeable! Token has launched!
+                    pool_address = new_pools[0].get("address")
+                    pool_type = new_pools[0].get("type", "dammv2")
+                    
+                    print(f"[LAUNCH_TRACKER] 🚀 NEW POOL DETECTED for {token_symbol}!")
+                    print(f"[LAUNCH_TRACKER]    Pool: {pool_address} (type: {pool_type})")
+                    print(f"[LAUNCH_TRACKER]    Existing pools: {len(existing_pools)}, New pools: {len(new_pools)}")
+                    print(f"[LAUNCH_TRACKER]    Jupiter: Tradeable with {jupiter_check.get('routes', 0)} routes")
+                    
+                    # Update state
+                    launch_detected_pools[token_address] = pool_address
+                    launch_tracker_tokens[token_address]["status"] = "launched"
+                    launch_tracker_tokens[token_address]["pool_address"] = pool_address
+                    launch_tracker_tokens[token_address]["launched_at"] = datetime.utcnow().isoformat()
+                    launch_tracker_tokens[token_address]["jupiter_tradeable"] = True
+                    save_launch_tracker_state()
+                    
+                    # Send notification with NEW pools and Jupiter info
+                    await send_launch_notification(token_address, token_data, new_pools, jupiter_check)
+                else:
+                    # Tradeable but no new pool (maybe via other DEX)
+                    print(f"[LAUNCH_TRACKER] {token_symbol}: Tradeable but no NEW Meteora pool yet ({len(pools)} existing)")
+            else:
+                # Tradeable on Jupiter but no Meteora pool
+                print(f"[LAUNCH_TRACKER] {token_symbol}: Tradeable on Jupiter but no Meteora pool found")
+                
+                # Option: Still notify if tradeable even without Meteora pool
+                # Uncomment below to enable this behavior:
+                # launch_tracker_tokens[token_address]["status"] = "tradeable_no_pool"
+                # save_launch_tracker_state()
+            
+            # Small delay between requests to avoid rate limiting
+            await asyncio.sleep(1)
+            
+        except Exception as e:
+            print(f"[LAUNCH_TRACKER] Error checking {token_address[:8]}...: {e}")
+            continue
+
+@poll_token_launches.before_loop
+async def before_poll_launches():
+    """Wait for bot to be ready before starting launch tracker."""
+    await bot.wait_until_ready()
+    load_launch_tracker_state()
+    print(f"[LAUNCH_TRACKER] Started with {len(launch_tracker_tokens)} token(s) to track")
+
+# ============================================================================
+# --- ICO TRACKER BACKGROUND TASK ---
+# ============================================================================
+
+async def send_ico_notification(ico_data: Dict, notification_type: str = "daily"):
+    """Send ICO notification to channel.
+    notification_type: 'daily', 'hour_warning', 'ended'
+    """
+    channel_id = ICO_TRACKER_CHANNEL_ID or DAMM_CHANNEL_ID or BOT_CALL_CHANNEL_ID
+    if not channel_id:
+        print("[ICO_TRACKER] No channel configured for notifications")
+        return
+    
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        print(f"[ICO_TRACKER] Channel {channel_id} not found")
+        return
+    
+    try:
+        ico_name = ico_data.get("name", "Unknown")
+        token_symbol = ico_data.get("token_symbol", "???")
+        end_time_str = ico_data.get("end_time", "")
+        target = ico_data.get("target", 0)
+        committed = ico_data.get("committed", 0)
+        url = ico_data.get("url", "")
+        token_address = ico_data.get("token_address", "")
+        
+        # Calculate time remaining
+        time_remaining_str = "N/A"
+        if end_time_str:
+            try:
+                end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+                now = datetime.now(end_time.tzinfo) if end_time.tzinfo else datetime.utcnow()
+                diff = end_time - now.replace(tzinfo=None) if not end_time.tzinfo else end_time - now
+                
+                total_seconds = int(diff.total_seconds())
+                if total_seconds > 0:
+                    days = total_seconds // 86400
+                    hours = (total_seconds % 86400) // 3600
+                    minutes = (total_seconds % 3600) // 60
+                    
+                    if days > 0:
+                        time_remaining_str = f"{days}D {hours}H {minutes}M"
+                    elif hours > 0:
+                        time_remaining_str = f"{hours}H {minutes}M"
+                    else:
+                        time_remaining_str = f"{minutes} menit"
+                else:
+                    time_remaining_str = "ENDED"
+            except:
+                pass
+        
+        # Format target and committed
+        target_str = f"${target:,.0f}" if target else "N/A"
+        committed_str = f"${committed:,.0f}" if committed else "N/A"
+        progress_pct = (committed / target * 100) if target and committed else 0
+        
+        # Create embed based on notification type
+        if notification_type == "hour_warning":
+            title = f"⏰ ICO ENDING SOON! {token_symbol}"
+            description = (
+                f"**{ico_name}** ICO akan berakhir dalam **{time_remaining_str}**!\n\n"
+                f"🚨 **LAST CHANCE TO PARTICIPATE!**"
+            )
+            color = 0xFF6600  # Orange
+        elif notification_type == "ended":
+            title = f"🏁 ICO ENDED: {token_symbol}"
+            description = f"**{ico_name}** ICO sudah berakhir!"
+            color = 0x888888  # Gray
+        else:  # daily
+            title = f"📊 ICO Update: {token_symbol}"
+            description = (
+                f"**{ico_name}** ICO masih berlangsung!\n\n"
+                f"⏱️ Sisa waktu: **{time_remaining_str}**"
+            )
+            color = 0x00AAFF  # Blue
+        
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(name="💰 Committed", value=committed_str, inline=True)
+        embed.add_field(name="🎯 Target", value=target_str, inline=True)
+        embed.add_field(name="📈 Progress", value=f"{progress_pct:.1f}%", inline=True)
+        embed.add_field(name="⏱️ Time Left", value=time_remaining_str, inline=True)
+        
+        # Links
+        links = []
+        if url:
+            links.append(f"[🍎 MetaDAO ICO]({url})")
+        if token_address:
+            links.extend([
+                f"[🔍 Solscan](https://solscan.io/token/{token_address})",
+                f"[📊 GMGN](https://gmgn.ai/sol/token/{token_address})"
+            ])
+        
+        if links:
+            embed.add_field(name="🔗 Links", value="\n".join(links), inline=False)
+        
+        embed.set_footer(text=f"ICO Tracker | {ico_name}")
+        
+        # Mention role for hour warning
+        mention_text = ""
+        if notification_type == "hour_warning" and MENTION_ROLE_ID:
+            mention_text = f"<@&{MENTION_ROLE_ID}> "
+        
+        await channel.send(content=f"{mention_text}", embed=embed)
+        print(f"[ICO_TRACKER] Sent {notification_type} notification for {ico_name}")
+        
+    except Exception as e:
+        print(f"[ICO_TRACKER] Error sending notification: {e}")
+        import traceback
+        traceback.print_exc()
+
+@tasks.loop(minutes=30)  # Check setiap 30 menit
+async def poll_ico_tracker():
+    """Poll ICO tracker for daily notifications and hour warnings."""
+    global ico_tracker_list
+    
+    if not ICO_TRACKER_ENABLED:
+        return
+    
+    if not ico_tracker_list:
+        return
+    
+    print(f"[ICO_TRACKER] Checking {len(ico_tracker_list)} tracked ICO(s)...")
+    now = datetime.utcnow()
+    today_str = now.strftime("%Y-%m-%d")
+    print(f"[ICO_TRACKER] Current UTC time: {now.isoformat()}")
+    
+    for ico_id, ico_data in list(ico_tracker_list.items()):
+        try:
+            end_time_str = ico_data.get("end_time", "")
+            if not end_time_str:
+                continue
+            
+            # Parse end time
+            try:
+                end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+                end_time_naive = end_time.replace(tzinfo=None) if end_time.tzinfo else end_time
+            except:
+                print(f"[ICO_TRACKER] Invalid end_time for {ico_id}")
+                continue
+            
+            # Calculate time remaining
+            diff = end_time_naive - now
+            total_seconds = int(diff.total_seconds())
+            
+            # Debug log
+            days_left = total_seconds // 86400
+            hours_left = (total_seconds % 86400) // 3600
+            print(f"[ICO_TRACKER] {ico_data.get('name')}: end_time={end_time_str}, remaining={days_left}d {hours_left}h ({total_seconds}s)")
+            
+            # Skip if already ended
+            if total_seconds <= 0:
+                # Send ended notification if not sent
+                if not ico_data.get("ended_notified"):
+                    await send_ico_notification(ico_data, "ended")
+                    ico_tracker_list[ico_id]["ended_notified"] = True
+                    save_ico_tracker_state()
+                continue
+            
+            # Check for 1 hour warning (between 30-90 minutes remaining)
+            if 1800 <= total_seconds <= 5400:  # 30-90 minutes
+                if not ico_data.get("hour_reminder_sent"):
+                    print(f"[ICO_TRACKER] 🚨 Sending 1-hour warning for {ico_data.get('name')}")
+                    await send_ico_notification(ico_data, "hour_warning")
+                    ico_tracker_list[ico_id]["hour_reminder_sent"] = True
+                    save_ico_tracker_state()
+            
+            # Check for daily notification (once per day)
+            daily_notified = ico_data.get("daily_notified_dates", [])
+            if today_str not in daily_notified:
+                print(f"[ICO_TRACKER] 📊 Sending daily update for {ico_data.get('name')}")
+                await send_ico_notification(ico_data, "daily")
+                
+                # Update notified dates
+                if "daily_notified_dates" not in ico_tracker_list[ico_id]:
+                    ico_tracker_list[ico_id]["daily_notified_dates"] = []
+                ico_tracker_list[ico_id]["daily_notified_dates"].append(today_str)
+                save_ico_tracker_state()
+            
+        except Exception as e:
+            print(f"[ICO_TRACKER] Error processing ICO {ico_id}: {e}")
+            continue
+
+@poll_ico_tracker.before_loop
+async def before_poll_ico():
+    """Wait for bot to be ready before starting ICO tracker."""
+    await bot.wait_until_ready()
+    load_ico_tracker_state()
+    print(f"[ICO_TRACKER] Started with {len(ico_tracker_list)} tracked ICO(s)")
 
 # --- SLASH COMMANDS UNTUK TRACK WALLET ---
 @bot.tree.command(name="add_wallet", description="Tambah wallet address untuk tracking (hanya buy transactions)")
@@ -4138,18 +5048,37 @@ async def hype_toggle(interaction: discord.Interaction):
 @bot.tree.command(name="hype_scan", description="🔍 Manual scan untuk hype tokens sekarang")
 @app_commands.check(_trading_admin_check)
 async def hype_scan_cmd(interaction: discord.Interaction):
-    """Manually trigger a hype token scan."""
-    if not TRADING_ENABLED:
-        await interaction.response.send_message("❌ Trading bot DISABLED.", ephemeral=True)
-        return
+    """Manually trigger a hype token scan. Works even if TRADING_ENABLED=false (scan only, no trade)."""
+    # Note: Removed TRADING_ENABLED check - scanning doesn't require trading to be enabled
     
     await interaction.response.defer(ephemeral=True)
     
     try:
+        print("[HYPE_SCAN] Starting manual scan...")
         qualifying_tokens = await scan_for_hype_tokens()
+        print(f"[HYPE_SCAN] Scan complete, found {len(qualifying_tokens) if qualifying_tokens else 0} tokens")
         
         if not qualifying_tokens:
-            await interaction.followup.send("❌ Tidak ada token yang memenuhi kriteria hype saat ini.", ephemeral=True)
+            # No tokens found - show helpful message with current criteria
+            embed = discord.Embed(
+                title="🔍 Scan Complete - No Hype Tokens Found",
+                description=(
+                    "Tidak ada token yang memenuhi **semua** kriteria saat ini.\n\n"
+                    "Ini normal karena kriteria cukup ketat untuk filter token berkualitas.\n\n"
+                    "**Kriteria saat ini:**"
+                ),
+                color=0xffaa00,  # Yellow
+                timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="Min Volume 5m", value=f"${TRADING_CONFIG.get('min_volume_5m_usd', 50000):,.0f}", inline=True)
+            embed.add_field(name="Min Txns 5m", value=f"{TRADING_CONFIG.get('min_txns_5m', 50)}", inline=True)
+            embed.add_field(name="Min Buyers 5m", value=f"{TRADING_CONFIG.get('min_buyers_5m', 30)}", inline=True)
+            embed.add_field(name="Price Change 5m", value=f"{TRADING_CONFIG.get('min_price_change_5m', 5)}% - {TRADING_CONFIG.get('max_price_change_5m', 50)}%", inline=True)
+            embed.add_field(name="Market Cap", value=f"${TRADING_CONFIG.get('hype_min_mcap', 100000):,.0f} - ${TRADING_CONFIG.get('hype_max_mcap', 5000000):,.0f}", inline=True)
+            embed.add_field(name="Liquidity", value=f"≥ ${TRADING_CONFIG.get('min_liquidity_usd', 5000):,.0f}", inline=True)
+            embed.set_footer(text="💡 Tip: Gunakan /hype_config untuk adjust kriteria jika terlalu ketat")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
         
         embed = discord.Embed(
@@ -4200,6 +5129,90 @@ async def hype_scan_cmd(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed, ephemeral=True)
         
     except Exception as e:
+        print(f"[HYPE_SCAN] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="hype_test", description="🧪 Quick test - scan 1 token trending untuk test API")
+@app_commands.check(_trading_admin_check)
+async def hype_test_cmd(interaction: discord.Interaction):
+    """Quick test to verify DexScreener API is working."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        global http_session
+        if not http_session:
+            http_session = aiohttp.ClientSession()
+        
+        results = []
+        
+        # Test 1: Boosted tokens API
+        print("[HYPE_TEST] Testing boosted tokens API...")
+        boosted_url = "https://api.dexscreener.com/token-boosts/latest/v1"
+        try:
+            async with http_session.get(boosted_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    solana_tokens = [t for t in data[:50] if t.get("chainId") == "solana"]
+                    results.append(f"✅ Boosted API: {len(solana_tokens)} Solana tokens")
+                else:
+                    results.append(f"❌ Boosted API: HTTP {response.status}")
+        except Exception as e:
+            results.append(f"❌ Boosted API: {str(e)[:50]}")
+        
+        # Test 2: Token profiles API
+        print("[HYPE_TEST] Testing profiles API...")
+        profiles_url = "https://api.dexscreener.com/token-profiles/latest/v1"
+        try:
+            async with http_session.get(profiles_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    solana_tokens = [t for t in data[:30] if t.get("chainId") == "solana"]
+                    results.append(f"✅ Profiles API: {len(solana_tokens)} Solana tokens")
+                else:
+                    results.append(f"❌ Profiles API: HTTP {response.status}")
+        except Exception as e:
+            results.append(f"❌ Profiles API: {str(e)[:50]}")
+        
+        # Test 3: Get one token detail
+        print("[HYPE_TEST] Testing token detail API...")
+        test_token = "So11111111111111111111111111111111111111112"  # SOL
+        try:
+            hype_data = await get_token_hype_data(test_token)
+            if hype_data:
+                results.append(f"✅ Token API: Got SOL data")
+            else:
+                results.append(f"⚠️ Token API: No data for SOL")
+        except Exception as e:
+            results.append(f"❌ Token API: {str(e)[:50]}")
+        
+        # Create response embed
+        embed = discord.Embed(
+            title="🧪 Hype API Test Results",
+            description="\n".join(results),
+            color=0x00ff00 if all("✅" in r for r in results) else 0xffaa00,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(
+            name="Current Config",
+            value=(
+                f"Volume 5m: ≥ ${TRADING_CONFIG.get('min_volume_5m_usd', 50000):,.0f}\n"
+                f"Txns 5m: ≥ {TRADING_CONFIG.get('min_txns_5m', 50)}\n"
+                f"MCap: ${TRADING_CONFIG.get('hype_min_mcap', 100000):,.0f} - ${TRADING_CONFIG.get('hype_max_mcap', 5000000):,.0f}"
+            ),
+            inline=False
+        )
+        
+        embed.set_footer(text="Jika semua ✅, coba /hype_scan untuk scan full")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        print(f"[HYPE_TEST] Error: {e}")
+        import traceback
+        traceback.print_exc()
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name="hype_config", description="⚙️ Lihat/ubah konfigurasi hype trading")
@@ -4221,10 +5234,8 @@ async def hype_config_cmd(
     min_mcap: Optional[float] = None,
     max_mcap: Optional[float] = None
 ):
-    """View or update hype trading configuration."""
-    if not TRADING_ENABLED:
-        await interaction.response.send_message("❌ Trading bot DISABLED.", ephemeral=True)
-        return
+    """View or update hype trading configuration. Works without TRADING_ENABLED."""
+    # Note: Removed TRADING_ENABLED check - config can be viewed/edited anytime
     
     # Update config if parameters provided
     updated = []
@@ -4394,6 +5405,571 @@ async def hype_command_error(interaction: discord.Interaction, error: app_comman
     else:
         await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
 
+# ============================================================================
+# --- LAUNCH TRACKER SLASH COMMANDS ---
+# ============================================================================
+
+@bot.tree.command(name="launch_add", description="🚀 Tambah token untuk tracking launch (detect pool DAMM v2)")
+@app_commands.describe(
+    token_address="Solana token contract address",
+    name="Nama token (opsional)",
+    symbol="Symbol token (opsional, misal: SOLO)"
+)
+@app_commands.check(_trading_admin_check)
+async def launch_add(
+    interaction: discord.Interaction,
+    token_address: str,
+    name: Optional[str] = None,
+    symbol: Optional[str] = None
+):
+    """Add a token to launch tracker."""
+    global launch_tracker_tokens
+    
+    # Validate address
+    if not is_valid_solana_address(token_address):
+        await interaction.response.send_message("❌ Invalid Solana address!", ephemeral=True)
+        return
+    
+    # Check if already tracking
+    if token_address in launch_tracker_tokens:
+        existing = launch_tracker_tokens[token_address]
+        status = existing.get("status", "tracking")
+        existing_pools = existing.get("existing_pools", [])
+        await interaction.response.send_message(
+            f"⚠️ Token sudah di-track!\n"
+            f"**Symbol:** {existing.get('symbol', 'N/A')}\n"
+            f"**Status:** {status}\n"
+            f"**Existing Pools:** {len(existing_pools)}\n"
+            f"**Added:** {existing.get('added_at', 'N/A')[:10]}\n\n"
+            f"💡 Bot akan detect pool **BARU** saja (bukan pool yang sudah ada).",
+            ephemeral=True
+        )
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    # Check existing pools - SAVE them to state (not notify for these)
+    pools = await fetch_dammv2_pools(token_address)
+    existing_pool_addresses = []
+    
+    if pools:
+        # Save existing pool addresses so we don't notify for them later
+        existing_pool_addresses = [p.get("address") for p in pools if p.get("address")]
+        
+        pool_info = []
+        for p in pools[:3]:  # Show max 3 pools
+            p_addr = p.get("address", "?")
+            p_type = p.get("type", "unknown")
+            pool_info.append(f"• `{p_addr[:16]}...` ({p_type.upper()})")
+        
+        pool_list = "\n".join(pool_info)
+        if len(pools) > 3:
+            pool_list += f"\n• ... dan {len(pools) - 3} pool lainnya"
+        
+        existing_msg = (
+            f"\n\n⚠️ **Pool yang SUDAH ADA** (akan di-skip):\n{pool_list}\n\n"
+            f"✅ Bot akan notify jika ada pool **BARU** yang dibuat!"
+        )
+    else:
+        existing_msg = "\n\n✨ Belum ada pool. Bot akan notify saat pool pertama dibuat!"
+    
+    # Add to tracking with existing pools saved
+    launch_tracker_tokens[token_address] = {
+        "name": name or "Unknown",
+        "symbol": symbol or "???",
+        "added_at": datetime.utcnow().isoformat(),
+        "added_by": str(interaction.user),
+        "status": "tracking",
+        "existing_pools": existing_pool_addresses  # Save existing pools to skip later
+    }
+    save_launch_tracker_state()
+    
+    await interaction.followup.send(
+        f"✅ **Token ditambahkan ke launch tracker!**\n\n"
+        f"**Token:** `{token_address}`\n"
+        f"**Name:** {name or 'Unknown'}\n"
+        f"**Symbol:** {symbol or '???'}\n"
+        f"**Existing Pools:** {len(existing_pool_addresses)}"
+        f"{existing_msg}\n"
+        f"🔍 Scanning setiap **{LAUNCH_TRACKER_POLL_INTERVAL_SEC} detik**",
+        ephemeral=True
+    )
+    print(f"[LAUNCH_TRACKER] Added token {token_address[:12]}... with {len(existing_pool_addresses)} existing pool(s)")
+
+@bot.tree.command(name="launch_remove", description="🗑️ Hapus token dari launch tracker")
+@app_commands.describe(token_address="Solana token contract address yang mau dihapus")
+@app_commands.check(_trading_admin_check)
+async def launch_remove(interaction: discord.Interaction, token_address: str):
+    """Remove a token from launch tracker."""
+    global launch_tracker_tokens, launch_detected_pools
+    
+    if token_address not in launch_tracker_tokens:
+        await interaction.response.send_message("❌ Token tidak ditemukan di tracker!", ephemeral=True)
+        return
+    
+    token_data = launch_tracker_tokens.pop(token_address)
+    launch_detected_pools.pop(token_address, None)
+    save_launch_tracker_state()
+    
+    await interaction.response.send_message(
+        f"✅ Token dihapus dari tracker!\n"
+        f"**Symbol:** {token_data.get('symbol', '???')}\n"
+        f"**Status:** {token_data.get('status', 'N/A')}",
+        ephemeral=True
+    )
+    print(f"[LAUNCH_TRACKER] Removed token {token_address[:12]}... by {interaction.user}")
+
+@bot.tree.command(name="launch_list", description="📋 Lihat daftar token yang sedang di-track")
+async def launch_list(interaction: discord.Interaction):
+    """List all tracked tokens."""
+    
+    if not launch_tracker_tokens:
+        await interaction.response.send_message(
+            "📋 **Launch Tracker kosong!**\n"
+            "Gunakan `/launch_add` untuk menambahkan token.",
+            ephemeral=True
+        )
+        return
+    
+    embed = discord.Embed(
+        title="🚀 Launch Tracker",
+        description=f"**{len(launch_tracker_tokens)}** token sedang di-track",
+        color=0x00ff88,
+        timestamp=datetime.utcnow()
+    )
+    
+    for address, data in list(launch_tracker_tokens.items())[:10]:
+        symbol = data.get("symbol", "???")
+        name = data.get("name", "Unknown")
+        status = data.get("status", "tracking")
+        added_at = data.get("added_at", "N/A")[:10]
+        pool_address = data.get("pool_address", "")
+        
+        status_emoji = "🔍" if status == "tracking" else "✅" if status == "launched" else "❌"
+        
+        value = f"**Name:** {name}\n**Status:** {status_emoji} {status}\n**Added:** {added_at}"
+        
+        if pool_address:
+            meteora_link = f"https://meteora.ag/dammv2/{pool_address}"
+            value += f"\n[🌊 View Pool]({meteora_link})"
+        
+        embed.add_field(
+            name=f"{symbol} - `{address[:12]}...`",
+            value=value,
+            inline=False
+        )
+    
+    if len(launch_tracker_tokens) > 10:
+        embed.set_footer(text=f"Showing 10 of {len(launch_tracker_tokens)} tokens")
+    else:
+        embed.set_footer(text=f"Poll interval: {LAUNCH_TRACKER_POLL_INTERVAL_SEC} detik")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="launch_check", description="🔍 Manual check pool untuk token tertentu")
+@app_commands.describe(token_address="Solana token contract address untuk di-check")
+@app_commands.check(_trading_admin_check)
+async def launch_check(interaction: discord.Interaction, token_address: str):
+    """Manually check if a token has pools available."""
+    
+    if not is_valid_solana_address(token_address):
+        await interaction.response.send_message("❌ Invalid Solana address!", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        pools = await fetch_dammv2_pools(token_address)
+        
+        if not pools:
+            await interaction.followup.send(
+                f"❌ **Tidak ada pool ditemukan**\n\n"
+                f"**Token:** `{token_address}`\n\n"
+                f"Token belum launch atau belum ada liquidity pool di Meteora.\n"
+                f"💡 Gunakan `/launch_add` untuk tracking otomatis!",
+                ephemeral=True
+            )
+            return
+        
+        # Pool found!
+        embed = discord.Embed(
+            title="🎉 Pool Ditemukan!",
+            description=f"**{len(pools)}** pool tersedia untuk token ini",
+            color=0x00ff00,
+            timestamp=datetime.utcnow()
+        )
+        
+        for i, pool in enumerate(pools[:5], 1):
+            pool_address = pool.get("address", "N/A")
+            pool_type = pool.get("type", "dammv2")
+            liquidity = pool.get("liquidity", 0)
+            
+            # Format liquidity
+            if liquidity:
+                try:
+                    liq_val = float(liquidity)
+                    if liq_val >= 1_000_000:
+                        liq_str = f"${liq_val/1_000_000:.2f}M"
+                    elif liq_val >= 1000:
+                        liq_str = f"${liq_val/1000:.2f}K"
+                    else:
+                        liq_str = f"${liq_val:.2f}"
+                except:
+                    liq_str = "N/A"
+            else:
+                liq_str = "N/A"
+            
+            # Create link
+            if pool_type == "dlmm":
+                meteora_link = f"https://app.meteora.ag/dlmm/{pool_address}"
+            else:
+                meteora_link = f"https://meteora.ag/dammv2/{pool_address}"
+            
+            embed.add_field(
+                name=f"Pool #{i} ({pool_type.upper()})",
+                value=(
+                    f"**Liquidity:** {liq_str}\n"
+                    f"**Address:** `{pool_address[:16]}...`\n"
+                    f"[🌊 Open Pool]({meteora_link})"
+                ),
+                inline=True
+            )
+        
+        # Additional links
+        embed.add_field(
+            name="🔗 Other Links",
+            value=(
+                f"[🪐 Jupiter](https://jup.ag/swap/SOL-{token_address})\n"
+                f"[📊 GMGN](https://gmgn.ai/sol/token/{token_address})\n"
+                f"[🔍 Solscan](https://solscan.io/token/{token_address})"
+            ),
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Token: {token_address[:12]}...{token_address[-8:]}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        print(f"[LAUNCH_CHECK] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="launch_rescan", description="🔄 Rescan existing pools untuk token yang di-track")
+@app_commands.describe(token_address="Token address untuk rescan (kosongkan untuk rescan semua)")
+@app_commands.check(_trading_admin_check)
+async def launch_rescan(interaction: discord.Interaction, token_address: Optional[str] = None):
+    """Rescan and update existing pools for tracked tokens."""
+    global launch_tracker_tokens
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    if token_address:
+        # Rescan specific token
+        if token_address not in launch_tracker_tokens:
+            await interaction.followup.send("❌ Token tidak ada di tracker!", ephemeral=True)
+            return
+        
+        tokens_to_scan = {token_address: launch_tracker_tokens[token_address]}
+    else:
+        # Rescan all tracking tokens
+        tokens_to_scan = {k: v for k, v in launch_tracker_tokens.items() if v.get("status") == "tracking"}
+    
+    if not tokens_to_scan:
+        await interaction.followup.send("❌ Tidak ada token yang perlu di-rescan!", ephemeral=True)
+        return
+    
+    results = []
+    for addr, data in tokens_to_scan.items():
+        symbol = data.get("symbol", "???")
+        try:
+            pools = await fetch_dammv2_pools(addr)
+            existing_addresses = [p.get("address") for p in pools if p.get("address")]
+            
+            # Update state
+            launch_tracker_tokens[addr]["existing_pools"] = existing_addresses
+            launch_tracker_tokens[addr]["status"] = "tracking"  # Reset status
+            
+            results.append(f"✅ **{symbol}**: {len(existing_addresses)} existing pool(s)")
+            await asyncio.sleep(1)  # Rate limit
+        except Exception as e:
+            results.append(f"❌ **{symbol}**: Error - {str(e)[:30]}")
+    
+    # Reset detected pools for rescanned tokens
+    for addr in tokens_to_scan:
+        launch_detected_pools.pop(addr, None)
+    
+    save_launch_tracker_state()
+    
+    await interaction.followup.send(
+        f"🔄 **Rescan Complete!**\n\n" + "\n".join(results) + 
+        "\n\n✅ Bot akan notify jika ada pool **BARU** yang dibuat!",
+        ephemeral=True
+    )
+
+@launch_add.error
+@launch_remove.error
+@launch_check.error
+@launch_rescan.error
+async def launch_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("❌ Kamu tidak punya izin untuk menggunakan command ini.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
+
+# ============================================================================
+# --- ICO TRACKER SLASH COMMANDS ---
+# ============================================================================
+
+@bot.tree.command(name="ico_add", description="🍎 Tambah ICO untuk tracking (daily + 1hr reminder)")
+@app_commands.describe(
+    name="Nama ICO/Project (contoh: 'Ranger')",
+    token_symbol="Symbol token (contoh: 'RNG')",
+    days_remaining="Berapa hari lagi ICO berakhir",
+    hours_remaining="Berapa jam lagi (tambahan dari hari)",
+    target="Target raise dalam USD (opsional)",
+    committed="Dana yang sudah committed dalam USD (opsional)",
+    url="URL halaman ICO (opsional)",
+    token_address="Token contract address (opsional)"
+)
+@app_commands.check(_trading_admin_check)
+async def ico_add(
+    interaction: discord.Interaction,
+    name: str,
+    token_symbol: str,
+    days_remaining: int,
+    hours_remaining: int = 0,
+    target: Optional[float] = None,
+    committed: Optional[float] = None,
+    url: Optional[str] = None,
+    token_address: Optional[str] = None
+):
+    """Add an ICO to the tracker."""
+    global ico_tracker_list
+    
+    # Generate ICO ID
+    ico_id = f"{token_symbol.upper()}-{int(time.time())}"
+    
+    # Calculate end time
+    total_seconds = (days_remaining * 86400) + (hours_remaining * 3600)
+    end_time = datetime.utcnow() + timedelta(seconds=total_seconds)
+    end_time_str = end_time.isoformat()
+    
+    # Create ICO entry
+    ico_tracker_list[ico_id] = {
+        "name": name,
+        "token_symbol": token_symbol.upper(),
+        "end_time": end_time_str,
+        "target": target or 0,
+        "committed": committed or 0,
+        "url": url or "",
+        "token_address": token_address or "",
+        "added_at": datetime.utcnow().isoformat(),
+        "added_by": str(interaction.user),
+        "daily_notified_dates": [],
+        "hour_reminder_sent": False,
+        "ended_notified": False
+    }
+    save_ico_tracker_state()
+    
+    # Format time remaining
+    if days_remaining > 0:
+        time_str = f"{days_remaining}D {hours_remaining}H"
+    else:
+        time_str = f"{hours_remaining}H"
+    
+    await interaction.response.send_message(
+        f"✅ **ICO ditambahkan ke tracker!**\n\n"
+        f"**Project:** {name}\n"
+        f"**Symbol:** {token_symbol.upper()}\n"
+        f"**Ends in:** {time_str}\n"
+        f"**Target:** ${target:,.0f}" if target else "" + "\n\n"
+        f"📅 Bot akan kirim notifikasi:\n"
+        f"• **Setiap hari** selama ICO berlangsung\n"
+        f"• **1 jam sebelum** ICO berakhir\n\n"
+        f"🆔 ICO ID: `{ico_id}`",
+        ephemeral=True
+    )
+    print(f"[ICO_TRACKER] Added ICO: {name} ({token_symbol}) - ends in {time_str}")
+
+@bot.tree.command(name="ico_remove", description="🗑️ Hapus ICO dari tracker")
+@app_commands.describe(ico_id="ICO ID yang mau dihapus (lihat dari /ico_list)")
+@app_commands.check(_trading_admin_check)
+async def ico_remove(interaction: discord.Interaction, ico_id: str):
+    """Remove an ICO from the tracker."""
+    global ico_tracker_list
+    
+    if ico_id not in ico_tracker_list:
+        await interaction.response.send_message("❌ ICO ID tidak ditemukan!", ephemeral=True)
+        return
+    
+    ico_data = ico_tracker_list.pop(ico_id)
+    save_ico_tracker_state()
+    
+    await interaction.response.send_message(
+        f"✅ ICO dihapus dari tracker!\n"
+        f"**Project:** {ico_data.get('name', 'Unknown')}\n"
+        f"**Symbol:** {ico_data.get('token_symbol', '???')}",
+        ephemeral=True
+    )
+    print(f"[ICO_TRACKER] Removed ICO: {ico_data.get('name')}")
+
+@bot.tree.command(name="ico_list", description="📋 Lihat daftar ICO yang sedang di-track")
+async def ico_list(interaction: discord.Interaction):
+    """List all tracked ICOs."""
+    
+    if not ico_tracker_list:
+        await interaction.response.send_message(
+            "📋 **ICO Tracker kosong!**\n"
+            "Gunakan `/ico_add` untuk menambahkan ICO.",
+            ephemeral=True
+        )
+        return
+    
+    embed = discord.Embed(
+        title="🍎 ICO Tracker",
+        description=f"**{len(ico_tracker_list)}** ICO sedang di-track",
+        color=0xFF6B6B,
+        timestamp=datetime.utcnow()
+    )
+    
+    now = datetime.utcnow()
+    
+    for ico_id, data in list(ico_tracker_list.items())[:10]:
+        name = data.get("name", "Unknown")
+        symbol = data.get("token_symbol", "???")
+        end_time_str = data.get("end_time", "")
+        target = data.get("target", 0)
+        committed = data.get("committed", 0)
+        hour_sent = data.get("hour_reminder_sent", False)
+        
+        # Calculate time remaining
+        time_remaining = "N/A"
+        status_emoji = "🟢"
+        if end_time_str:
+            try:
+                end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+                end_naive = end_time.replace(tzinfo=None) if end_time.tzinfo else end_time
+                diff = end_naive - now
+                total_seconds = int(diff.total_seconds())
+                
+                if total_seconds <= 0:
+                    time_remaining = "ENDED"
+                    status_emoji = "🔴"
+                elif total_seconds <= 3600:
+                    time_remaining = f"{total_seconds // 60}M"
+                    status_emoji = "🟠"
+                else:
+                    days = total_seconds // 86400
+                    hours = (total_seconds % 86400) // 3600
+                    if days > 0:
+                        time_remaining = f"{days}D {hours}H"
+                    else:
+                        time_remaining = f"{hours}H"
+            except:
+                pass
+        
+        progress = (committed / target * 100) if target and committed else 0
+        hour_status = "✅" if hour_sent else "⏳"
+        
+        embed.add_field(
+            name=f"{status_emoji} {symbol} - {name}",
+            value=(
+                f"⏱️ **{time_remaining}** remaining\n"
+                f"💰 ${committed:,.0f} / ${target:,.0f} ({progress:.0f}%)\n"
+                f"🔔 1hr reminder: {hour_status}\n"
+                f"🆔 `{ico_id}`"
+            ),
+            inline=False
+        )
+    
+    if len(ico_tracker_list) > 10:
+        embed.set_footer(text=f"Showing 10 of {len(ico_tracker_list)} ICOs")
+    else:
+        embed.set_footer(text="Notifications: Daily + 1 hour before end")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="ico_update", description="📝 Update data ICO (committed, target)")
+@app_commands.describe(
+    ico_id="ICO ID yang mau di-update",
+    committed="Update jumlah committed (USD)",
+    target="Update target (USD)"
+)
+@app_commands.check(_trading_admin_check)
+async def ico_update(
+    interaction: discord.Interaction,
+    ico_id: str,
+    committed: Optional[float] = None,
+    target: Optional[float] = None
+):
+    """Update ICO data."""
+    global ico_tracker_list
+    
+    if ico_id not in ico_tracker_list:
+        await interaction.response.send_message("❌ ICO ID tidak ditemukan!", ephemeral=True)
+        return
+    
+    updates = []
+    if committed is not None:
+        ico_tracker_list[ico_id]["committed"] = committed
+        updates.append(f"Committed: ${committed:,.0f}")
+    
+    if target is not None:
+        ico_tracker_list[ico_id]["target"] = target
+        updates.append(f"Target: ${target:,.0f}")
+    
+    if not updates:
+        await interaction.response.send_message("⚠️ Tidak ada update yang dilakukan!", ephemeral=True)
+        return
+    
+    save_ico_tracker_state()
+    
+    await interaction.response.send_message(
+        f"✅ ICO di-update!\n\n**Updates:**\n" + "\n".join(f"• {u}" for u in updates),
+        ephemeral=True
+    )
+
+@bot.tree.command(name="ico_notify", description="📢 Kirim notifikasi ICO sekarang (manual)")
+@app_commands.describe(
+    ico_id="ICO ID untuk kirim notifikasi",
+    notification_type="Tipe notifikasi"
+)
+@app_commands.choices(notification_type=[
+    app_commands.Choice(name="Daily Update", value="daily"),
+    app_commands.Choice(name="1 Hour Warning", value="hour_warning"),
+])
+@app_commands.check(_trading_admin_check)
+async def ico_notify(
+    interaction: discord.Interaction,
+    ico_id: str,
+    notification_type: str = "daily"
+):
+    """Manually send ICO notification."""
+    
+    if ico_id not in ico_tracker_list:
+        await interaction.response.send_message("❌ ICO ID tidak ditemukan!", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        await send_ico_notification(ico_tracker_list[ico_id], notification_type)
+        await interaction.followup.send(f"✅ Notifikasi `{notification_type}` dikirim!", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@ico_add.error
+@ico_remove.error
+@ico_update.error
+@ico_notify.error
+async def ico_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("❌ Kamu tidak punya izin untuk menggunakan command ini.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
+
 @bot.tree.command(name="metadao_test", description="Kirim notifikasi MetaDAO test ke channel damm")
 @app_commands.describe(
     project_name="Nama project/raise",
@@ -4444,6 +6020,116 @@ async def metadao_test(
 
 @metadao_test.error
 async def metadao_test_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("❌ Kamu tidak punya izin untuk menjalankan command ini.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
+
+@bot.tree.command(name="metadao_fetch", description="🔍 Manual fetch & debug MetaDAO projects (admin only)")
+@app_commands.check(_metadao_admin_check)
+async def metadao_fetch(interaction: discord.Interaction):
+    """Manually fetch MetaDAO projects and show debug info."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        global http_session
+        if not http_session:
+            http_session = aiohttp.ClientSession()
+        
+        # Headers untuk request
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        
+        results = []
+        html = None
+        
+        # Step 1: Fetch HTML
+        results.append("**Step 1: Fetching MetaDAO page...**")
+        try:
+            async with http_session.get(
+                METADAO_PROJECTS_URL,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                results.append(f"• Status: {response.status}")
+                results.append(f"• Content-Type: {response.headers.get('Content-Type', 'N/A')}")
+                
+                if response.status == 200:
+                    html = await response.text()
+                    results.append(f"• HTML length: {len(html):,} chars")
+                elif response.status == 429:
+                    results.append("• ❌ Rate limited (429)! Coba lagi nanti.")
+                else:
+                    results.append(f"• ❌ HTTP Error: {response.status}")
+        except Exception as e:
+            results.append(f"• ❌ Request failed: {str(e)[:100]}")
+        
+        # Step 2: Check HTML content markers
+        if html:
+            results.append("\n**Step 2: Checking HTML content markers...**")
+            markers = [
+                ("__NEXT_DATA__", '<script id="__NEXT_DATA__"'),
+                ('{"items":[', '{"items":['),
+                ("timeRemaining", '"timeRemaining"'),
+                ("organizationSlug", '"organizationSlug"'),
+                ("fundraise", '"fundraise"'),
+                ("minimumRaise", '"minimumRaise"'),
+            ]
+            for name, marker in markers:
+                found = marker in html
+                status = "✅ Found" if found else "❌ Not found"
+                results.append(f"• {name}: {status}")
+        
+        # Step 3: Try to extract items
+        if html:
+            results.append("\n**Step 3: Extracting project data...**")
+            items = _extract_metadao_items(html)
+            results.append(f"• Raw items found: {len(items)}")
+            
+            if items:
+                # Show first item structure
+                results.append("\n**Sample item keys:**")
+                first_item = items[0]
+                if isinstance(first_item, dict):
+                    keys = list(first_item.keys())[:15]
+                    results.append(f"• Keys: {', '.join(keys)}")
+        
+        # Step 4: Fetch via main function
+        results.append("\n**Step 4: Fetching via fetch_metadao_launches()...**")
+        launches = await fetch_metadao_launches()
+        results.append(f"• Active launches found: {len(launches)}")
+        
+        if launches:
+            results.append("\n**Active Launches:**")
+            for i, launch in enumerate(launches[:5], 1):
+                name = launch.get("name", "Unknown")
+                symbol = launch.get("token_symbol", "N/A")
+                remaining = launch.get("time_remaining", 0)
+                remaining_hr = remaining / 3600 if remaining else 0
+                results.append(f"{i}. **{name}** (${symbol}) - {remaining_hr:.1f}h remaining")
+        
+        # Create embed
+        embed = discord.Embed(
+            title="🔍 MetaDAO Fetch Debug",
+            description="\n".join(results),
+            color=0x00ff00 if launches else 0xff6600,
+            timestamp=datetime.utcnow()
+        )
+        embed.set_footer(text=f"Poll interval: {METADAO_POLL_INTERVAL_MINUTES} minutes")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        print(f"[ERROR] metadao_fetch: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@metadao_fetch.error
+async def metadao_fetch_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
         await interaction.response.send_message("❌ Kamu tidak punya izin untuk menjalankan command ini.", ephemeral=True)
     else:
