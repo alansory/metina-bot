@@ -145,6 +145,1075 @@ bot_call_notified_tokens: Dict[str, str] = {}  # {token_address: date_notified (
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "efd896ec-30ed-4c89-a990-32b315e13d20")  # Jupiter API key
 USE_METEORA_FOR_FEES = os.getenv("USE_METEORA_FOR_FEES", "false").lower() == "true"  # Use Meteora for volume/fees data
 
+# ============================================================================
+# --- FITUR BARU: AUTO TRADING BOT (FULL AUTO) ---
+# ============================================================================
+# ⚠️ WARNING: Fitur ini SANGAT BERISIKO! Bisa kehilangan dana!
+# Pastikan kamu paham risikonya sebelum mengaktifkan.
+# ============================================================================
+
+# Trading Wallet Config (PRIVATE KEY HARUS DARI ENV VARIABLE!)
+TRADING_WALLET_PRIVATE_KEY = os.getenv("TRADING_WALLET_PRIVATE_KEY")  # Base58 private key
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
+TRADING_CHANNEL_ID = int(os.getenv("TRADING_CHANNEL_ID", "0")) or None  # Channel untuk trading notifications
+
+# Trading Parameters
+TRADING_CONFIG = {
+    # ⚠️ DRY RUN MODE - Set true untuk test tanpa pakai uang asli!
+    "dry_run": os.getenv("TRADING_DRY_RUN", "true").lower() == "true",  # Default TRUE = TIDAK trade beneran
+    
+    "take_profit_percent": float(os.getenv("TRADING_TP_PERCENT", "7")),  # Take profit at 7%
+    "stop_loss_percent": float(os.getenv("TRADING_SL_PERCENT", "5")),    # Stop loss at -5%
+    "max_position_sol": float(os.getenv("TRADING_MAX_SOL", "0.5")),      # Max 0.5 SOL per trade
+    "max_concurrent_positions": int(os.getenv("TRADING_MAX_POSITIONS", "3")),  # Max 3 positions
+    "max_hold_minutes": int(os.getenv("TRADING_MAX_HOLD_MIN", "30")),    # Auto sell after 30 min
+    "slippage_bps": int(os.getenv("TRADING_SLIPPAGE_BPS", "300")),       # 3% slippage (300 bps)
+    "price_check_interval_sec": int(os.getenv("TRADING_CHECK_INTERVAL", "15")),  # Check price every 15s
+    "auto_trade_from_bot_call": os.getenv("TRADING_AUTO_FROM_BOTCALL", "false").lower() == "true",
+    "min_liquidity_usd": float(os.getenv("TRADING_MIN_LIQ", "5000")),    # Min $5000 liquidity
+    "daily_loss_limit_sol": float(os.getenv("TRADING_DAILY_LOSS_LIMIT", "2")),  # Max 2 SOL loss per day
+    
+    # ============================================================================
+    # HYPE TRADING CONFIG - Volume Spike + Social + KOL Detection
+    # ============================================================================
+    "hype_trading_enabled": os.getenv("HYPE_TRADING_ENABLED", "false").lower() == "true",
+    "hype_scan_interval_sec": int(os.getenv("HYPE_SCAN_INTERVAL", "60")),  # Scan setiap 60 detik
+    
+    # Volume Spike Detection (1-5 menit)
+    "min_volume_5m_usd": float(os.getenv("HYPE_MIN_VOL_5M", "50000")),     # Min $50k volume dalam 5 menit
+    "min_volume_1h_usd": float(os.getenv("HYPE_MIN_VOL_1H", "100000")),    # Min $100k volume 1 jam
+    "min_txns_5m": int(os.getenv("HYPE_MIN_TXNS_5M", "50")),               # Min 50 transaksi dalam 5 menit
+    "min_buyers_5m": int(os.getenv("HYPE_MIN_BUYERS_5M", "30")),           # Min 30 unique buyers dalam 5 menit
+    
+    # Price Action Filter
+    "min_price_change_5m": float(os.getenv("HYPE_MIN_PRICE_5M", "5")),     # Min +5% dalam 5 menit
+    "max_price_change_5m": float(os.getenv("HYPE_MAX_PRICE_5M", "50")),    # Max +50% (hindari pump & dump)
+    
+    # Market Cap Filter
+    "hype_min_mcap": float(os.getenv("HYPE_MIN_MCAP", "100000")),          # Min $100k market cap
+    "hype_max_mcap": float(os.getenv("HYPE_MAX_MCAP", "5000000")),         # Max $5M market cap (early stage)
+    
+    # Social/Hype Score (dari DexScreener)
+    "min_social_score": int(os.getenv("HYPE_MIN_SOCIAL", "0")),            # Min social score (0 = disabled)
+    
+    # KOL Tracking
+    "kol_tracking_enabled": os.getenv("KOL_TRACKING_ENABLED", "false").lower() == "true",
+    "min_kol_buys": int(os.getenv("HYPE_MIN_KOL_BUYS", "2")),              # Min 2 KOL beli dalam 5 menit
+    "kol_buy_min_sol": float(os.getenv("KOL_BUY_MIN_SOL", "1")),           # Min 1 SOL pembelian KOL
+    
+    # Token Age Filter
+    "max_token_age_hours": int(os.getenv("HYPE_MAX_AGE_HOURS", "72")),     # Max umur token 72 jam (3 hari)
+    "min_token_age_minutes": int(os.getenv("HYPE_MIN_AGE_MIN", "5")),      # Min umur 5 menit (hindari honeypot)
+}
+
+# KOL (Key Opinion Leader) Wallets - tambahkan wallet KOL Solana yang dikenal
+# Format: {"wallet": "address", "name": "KOL Name", "weight": 1-5}
+KOL_WALLETS_FILE = "kol_wallets.json"
+KOL_WALLETS: List[Dict[str, object]] = []
+
+# Hype Detection State
+HYPE_TOKENS_FILE = "hype_tokens_state.json"
+hype_detected_tokens: Dict[str, Dict] = {}  # {token_address: detection_data}
+hype_traded_tokens: Dict[str, str] = {}  # {token_address: date_traded}
+
+def load_kol_wallets():
+    """Load KOL wallet list from file."""
+    global KOL_WALLETS
+    try:
+        if os.path.exists(KOL_WALLETS_FILE):
+            with open(KOL_WALLETS_FILE, 'r') as f:
+                KOL_WALLETS = json.load(f)
+            print(f"[HYPE] Loaded {len(KOL_WALLETS)} KOL wallet(s)")
+        else:
+            # Default KOL wallets (some known Solana traders - ADD YOUR OWN!)
+            KOL_WALLETS = [
+                # Example format - replace dengan wallet KOL yang kamu track
+                # {"wallet": "WALLET_ADDRESS", "name": "KOL Name", "weight": 3},
+            ]
+            save_kol_wallets()
+            print(f"[HYPE] Created empty KOL wallets file - add wallets to {KOL_WALLETS_FILE}")
+    except Exception as e:
+        print(f"[ERROR] Failed to load KOL wallets: {e}")
+        KOL_WALLETS = []
+
+def save_kol_wallets():
+    """Save KOL wallet list to file."""
+    try:
+        with open(KOL_WALLETS_FILE, 'w') as f:
+            json.dump(KOL_WALLETS, f, indent=4)
+    except Exception as e:
+        print(f"[ERROR] Failed to save KOL wallets: {e}")
+
+def load_hype_state():
+    """Load hype detection state."""
+    global hype_detected_tokens, hype_traded_tokens
+    try:
+        if os.path.exists(HYPE_TOKENS_FILE):
+            with open(HYPE_TOKENS_FILE, 'r') as f:
+                data = json.load(f)
+                hype_detected_tokens = data.get("detected", {})
+                hype_traded_tokens = data.get("traded", {})
+            print(f"[HYPE] Loaded state: {len(hype_detected_tokens)} detected, {len(hype_traded_tokens)} traded")
+    except Exception as e:
+        print(f"[ERROR] Failed to load hype state: {e}")
+
+def save_hype_state():
+    """Save hype detection state."""
+    try:
+        with open(HYPE_TOKENS_FILE, 'w') as f:
+            json.dump({
+                "detected": hype_detected_tokens,
+                "traded": hype_traded_tokens
+            }, f, indent=4)
+    except Exception as e:
+        print(f"[ERROR] Failed to save hype state: {e}")
+
+# Trading State
+TRADING_POSITIONS_FILE = "trading_positions.json"
+TRADING_HISTORY_FILE = "trading_history.json"
+active_positions: Dict[str, Dict] = {}  # {token_address: position_data}
+trading_history: List[Dict] = []  # History of closed trades
+daily_pnl: float = 0.0  # Track daily P&L
+daily_pnl_date: str = ""  # Date of daily P&L tracking
+
+# Validate trading config on startup
+if TRADING_ENABLED:
+    if not TRADING_WALLET_PRIVATE_KEY:
+        print("❌ TRADING_ENABLED=true but TRADING_WALLET_PRIVATE_KEY not set!")
+        print("⚠️ Trading will be DISABLED for safety.")
+        TRADING_ENABLED = False
+    else:
+        print(f"✅ Trading Bot ENABLED!")
+        print(f"   - Take Profit: {TRADING_CONFIG['take_profit_percent']}%")
+        print(f"   - Stop Loss: {TRADING_CONFIG['stop_loss_percent']}%")
+        print(f"   - Max Position: {TRADING_CONFIG['max_position_sol']} SOL")
+        print(f"   - Max Concurrent: {TRADING_CONFIG['max_concurrent_positions']} positions")
+        print(f"   - Daily Loss Limit: {TRADING_CONFIG['daily_loss_limit_sol']} SOL")
+else:
+    print("ℹ️ Trading Bot DISABLED (set TRADING_ENABLED=true to enable)")
+
+def load_trading_positions():
+    """Load active trading positions from file."""
+    global active_positions
+    try:
+        if os.path.exists(TRADING_POSITIONS_FILE):
+            with open(TRADING_POSITIONS_FILE, 'r') as f:
+                active_positions = json.load(f)
+            print(f"[TRADING] Loaded {len(active_positions)} active position(s)")
+    except Exception as e:
+        print(f"[ERROR] Failed to load trading positions: {e}")
+        active_positions = {}
+
+def save_trading_positions():
+    """Save active trading positions to file."""
+    try:
+        with open(TRADING_POSITIONS_FILE, 'w') as f:
+            json.dump(active_positions, f, indent=4)
+    except Exception as e:
+        print(f"[ERROR] Failed to save trading positions: {e}")
+
+def load_trading_history():
+    """Load trading history from file."""
+    global trading_history
+    try:
+        if os.path.exists(TRADING_HISTORY_FILE):
+            with open(TRADING_HISTORY_FILE, 'r') as f:
+                trading_history = json.load(f)
+            print(f"[TRADING] Loaded {len(trading_history)} historical trade(s)")
+    except Exception as e:
+        print(f"[ERROR] Failed to load trading history: {e}")
+        trading_history = []
+
+def save_trading_history():
+    """Save trading history to file."""
+    try:
+        with open(TRADING_HISTORY_FILE, 'w') as f:
+            json.dump(trading_history, f, indent=4)
+    except Exception as e:
+        print(f"[ERROR] Failed to save trading history: {e}")
+
+def reset_daily_pnl_if_needed():
+    """Reset daily P&L if it's a new day."""
+    global daily_pnl, daily_pnl_date
+    today = datetime.now().strftime("%Y-%m-%d")
+    if daily_pnl_date != today:
+        daily_pnl = 0.0
+        daily_pnl_date = today
+        print(f"[TRADING] Daily P&L reset for {today}")
+
+async def get_token_price(token_address: str) -> Optional[float]:
+    """Get current token price in USD from Jupiter/DexScreener."""
+    global http_session
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    try:
+        # Try Jupiter Price API first
+        url = f"https://price.jup.ag/v6/price?ids={token_address}"
+        async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if response.status == 200:
+                data = await response.json()
+                if "data" in data and token_address in data["data"]:
+                    price = data["data"][token_address].get("price")
+                    if price:
+                        return float(price)
+    except Exception as e:
+        print(f"[TRADING] Jupiter price fetch failed: {e}")
+    
+    # Fallback to DexScreener
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+        async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if response.status == 200:
+                data = await response.json()
+                pairs = data.get("pairs") or []
+                if pairs:
+                    # Get price from most liquid pair
+                    best_pair = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                    price = best_pair.get("priceUsd")
+                    if price:
+                        return float(price)
+    except Exception as e:
+        print(f"[TRADING] DexScreener price fetch failed: {e}")
+    
+    return None
+
+async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int = 300) -> Optional[Dict]:
+    """Get swap quote from Jupiter API."""
+    global http_session
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    try:
+        url = "https://quote-api.jup.ag/v6/quote"
+        params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount),
+            "slippageBps": slippage_bps,
+            "onlyDirectRoutes": "false",
+            "asLegacyTransaction": "false",
+        }
+        
+        async with http_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status == 200:
+                return await response.json()
+            else:
+                error_text = await response.text()
+                print(f"[TRADING] Jupiter quote error: {response.status} - {error_text}")
+                return None
+    except Exception as e:
+        print(f"[TRADING] Jupiter quote failed: {e}")
+        return None
+
+async def execute_jupiter_swap(quote: Dict) -> Optional[str]:
+    """Execute swap via Jupiter API. Returns transaction signature if successful."""
+    global http_session
+    
+    if not TRADING_WALLET_PRIVATE_KEY:
+        print("[TRADING] No private key configured!")
+        return None
+    
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    try:
+        # Import solana libraries (lazy import to avoid startup errors if not installed)
+        from solders.keypair import Keypair
+        from solders.transaction import VersionedTransaction
+        from solders.signature import Signature
+        import base58
+        import base64
+        
+        # Decode private key
+        try:
+            private_key_bytes = base58.b58decode(TRADING_WALLET_PRIVATE_KEY)
+            keypair = Keypair.from_bytes(private_key_bytes)
+            wallet_pubkey = str(keypair.pubkey())
+        except Exception as e:
+            print(f"[TRADING] Invalid private key format: {e}")
+            return None
+        
+        # Get swap transaction from Jupiter
+        swap_url = "https://quote-api.jup.ag/v6/swap"
+        swap_data = {
+            "quoteResponse": quote,
+            "userPublicKey": wallet_pubkey,
+            "wrapAndUnwrapSol": True,
+            "dynamicComputeUnitLimit": True,
+            "prioritizationFeeLamports": "auto",
+        }
+        
+        async with http_session.post(swap_url, json=swap_data, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                print(f"[TRADING] Jupiter swap request failed: {response.status} - {error_text}")
+                return None
+            
+            swap_response = await response.json()
+            swap_transaction = swap_response.get("swapTransaction")
+            
+            if not swap_transaction:
+                print("[TRADING] No swap transaction in response")
+                return None
+        
+        # Decode and sign transaction
+        tx_bytes = base64.b64decode(swap_transaction)
+        transaction = VersionedTransaction.from_bytes(tx_bytes)
+        
+        # Sign the transaction
+        signed_tx = VersionedTransaction(transaction.message, [keypair])
+        
+        # Send transaction via Helius RPC
+        rpc_url = HELIUS_RPC_URL if HELIUS_API_KEY else "https://api.mainnet-beta.solana.com"
+        
+        tx_base64 = base64.b64encode(bytes(signed_tx)).decode('utf-8')
+        
+        rpc_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                tx_base64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": False,
+                    "preflightCommitment": "confirmed",
+                    "maxRetries": 3,
+                }
+            ]
+        }
+        
+        async with http_session.post(rpc_url, json=rpc_payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
+            result = await response.json()
+            
+            if "error" in result:
+                print(f"[TRADING] Transaction failed: {result['error']}")
+                return None
+            
+            signature = result.get("result")
+            if signature:
+                print(f"[TRADING] ✅ Transaction sent: {signature}")
+                return signature
+            
+            return None
+            
+    except ImportError as e:
+        print(f"[TRADING] Missing required library: {e}")
+        print("[TRADING] Install with: pip install solders base58")
+        return None
+    except Exception as e:
+        print(f"[TRADING] Swap execution error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+async def open_trading_position(token_address: str, amount_sol: float, token_name: str = None, token_symbol: str = None) -> Tuple[bool, str]:
+    """Open a new trading position (buy token with SOL)."""
+    global active_positions, daily_pnl
+    
+    # Safety checks
+    if not TRADING_ENABLED:
+        return False, "Trading is disabled"
+    
+    if not TRADING_WALLET_PRIVATE_KEY:
+        return False, "Trading wallet not configured"
+    
+    reset_daily_pnl_if_needed()
+    
+    # Check daily loss limit
+    if daily_pnl <= -TRADING_CONFIG["daily_loss_limit_sol"]:
+        return False, f"Daily loss limit reached ({daily_pnl:.4f} SOL)"
+    
+    # Check max concurrent positions
+    if len(active_positions) >= TRADING_CONFIG["max_concurrent_positions"]:
+        return False, f"Max concurrent positions ({TRADING_CONFIG['max_concurrent_positions']}) reached"
+    
+    # Check if already in position
+    if token_address in active_positions:
+        return False, "Already in position for this token"
+    
+    # Validate amount
+    if amount_sol > TRADING_CONFIG["max_position_sol"]:
+        amount_sol = TRADING_CONFIG["max_position_sol"]
+        print(f"[TRADING] Amount capped to max: {amount_sol} SOL")
+    
+    if amount_sol < 0.01:
+        return False, "Minimum amount is 0.01 SOL"
+    
+    # Get current token price before buying
+    entry_price = await get_token_price(token_address)
+    if not entry_price:
+        return False, "Could not fetch token price"
+    
+    # Convert SOL to lamports
+    amount_lamports = int(amount_sol * 1_000_000_000)
+    
+    # Get Jupiter quote (SOL -> Token)
+    quote = await get_jupiter_quote(
+        input_mint=SOL_MINT,
+        output_mint=token_address,
+        amount=amount_lamports,
+        slippage_bps=TRADING_CONFIG["slippage_bps"]
+    )
+    
+    if not quote:
+        return False, "Could not get swap quote from Jupiter"
+    
+    # Check liquidity/output
+    out_amount = int(quote.get("outAmount", 0))
+    if out_amount <= 0:
+        return False, "Invalid quote output amount"
+    
+    # Execute swap
+    signature = await execute_jupiter_swap(quote)
+    
+    if not signature:
+        return False, "Swap execution failed"
+    
+    # Record position
+    now = time.time()
+    position = {
+        "token_address": token_address,
+        "token_name": token_name or "Unknown",
+        "token_symbol": token_symbol or "???",
+        "entry_price_usd": entry_price,
+        "entry_amount_sol": amount_sol,
+        "entry_amount_lamports": amount_lamports,
+        "tokens_received": out_amount,
+        "entry_time": now,
+        "entry_tx": signature,
+        "take_profit_price": entry_price * (1 + TRADING_CONFIG["take_profit_percent"] / 100),
+        "stop_loss_price": entry_price * (1 - TRADING_CONFIG["stop_loss_percent"] / 100),
+        "max_hold_until": now + (TRADING_CONFIG["max_hold_minutes"] * 60),
+        "status": "open",
+    }
+    
+    active_positions[token_address] = position
+    save_trading_positions()
+    
+    return True, signature
+
+async def close_trading_position(token_address: str, reason: str = "manual") -> Tuple[bool, str, Optional[float]]:
+    """Close a trading position (sell token for SOL). Returns (success, message, pnl_sol)."""
+    global active_positions, daily_pnl, trading_history
+    
+    if token_address not in active_positions:
+        return False, "Position not found", None
+    
+    position = active_positions[token_address]
+    
+    # Get current price
+    current_price = await get_token_price(token_address)
+    if not current_price:
+        return False, "Could not fetch current price", None
+    
+    # Get Jupiter quote (Token -> SOL)
+    quote = await get_jupiter_quote(
+        input_mint=token_address,
+        output_mint=SOL_MINT,
+        amount=position["tokens_received"],
+        slippage_bps=TRADING_CONFIG["slippage_bps"]
+    )
+    
+    if not quote:
+        return False, "Could not get sell quote from Jupiter", None
+    
+    # Execute swap
+    signature = await execute_jupiter_swap(quote)
+    
+    if not signature:
+        return False, "Sell execution failed", None
+    
+    # Calculate P&L
+    out_amount_lamports = int(quote.get("outAmount", 0))
+    out_amount_sol = out_amount_lamports / 1_000_000_000
+    pnl_sol = out_amount_sol - position["entry_amount_sol"]
+    pnl_percent = (pnl_sol / position["entry_amount_sol"]) * 100
+    
+    # Update daily P&L
+    reset_daily_pnl_if_needed()
+    daily_pnl += pnl_sol
+    
+    # Record to history
+    history_entry = {
+        **position,
+        "exit_price_usd": current_price,
+        "exit_amount_sol": out_amount_sol,
+        "exit_time": time.time(),
+        "exit_tx": signature,
+        "pnl_sol": pnl_sol,
+        "pnl_percent": pnl_percent,
+        "close_reason": reason,
+        "status": "closed",
+    }
+    trading_history.append(history_entry)
+    save_trading_history()
+    
+    # Remove from active positions
+    del active_positions[token_address]
+    save_trading_positions()
+    
+    return True, signature, pnl_sol
+
+async def send_trading_notification(title: str, description: str, color: int, position: Dict = None, pnl: float = None):
+    """Send trading notification to Discord channel."""
+    if not TRADING_CHANNEL_ID:
+        return
+    
+    channel = bot.get_channel(TRADING_CHANNEL_ID)
+    if not channel:
+        # Fallback to bot call channel
+        channel = bot.get_channel(BOT_CALL_CHANNEL_ID)
+    
+    if not channel:
+        return
+    
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color,
+        timestamp=datetime.utcnow()
+    )
+    
+    if position:
+        token_symbol = position.get("token_symbol", "???")
+        token_address = position.get("token_address", "")
+        entry_price = position.get("entry_price_usd", 0)
+        entry_sol = position.get("entry_amount_sol", 0)
+        
+        embed.add_field(name="Token", value=f"**{token_symbol}**\n`{token_address[:8]}...`", inline=True)
+        embed.add_field(name="Entry", value=f"${entry_price:.8f}\n{entry_sol:.4f} SOL", inline=True)
+        
+        if pnl is not None:
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            pnl_percent = (pnl / entry_sol) * 100 if entry_sol > 0 else 0
+            embed.add_field(name="P&L", value=f"{pnl_emoji} {pnl:+.4f} SOL\n({pnl_percent:+.2f}%)", inline=True)
+        
+        # Links
+        links = f"[Solscan](https://solscan.io/token/{token_address}) | [Jupiter](https://jup.ag/swap/SOL-{token_address})"
+        embed.add_field(name="Links", value=links, inline=False)
+    
+    embed.set_footer(text=f"Daily P&L: {daily_pnl:+.4f} SOL | Positions: {len(active_positions)}/{TRADING_CONFIG['max_concurrent_positions']}")
+    
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"[TRADING] Failed to send notification: {e}")
+
+# ============================================================================
+# --- HYPE TRADING: Volume Spike + Social + KOL Detection ---
+# ============================================================================
+
+async def fetch_trending_tokens_dexscreener() -> List[Dict]:
+    """Fetch trending/boosted tokens dari DexScreener dengan data real-time."""
+    global http_session
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    trending_tokens = []
+    
+    try:
+        # DexScreener Boosted Tokens API (tokens yang di-boost/promoted)
+        boosted_url = "https://api.dexscreener.com/token-boosts/latest/v1"
+        async with http_session.get(boosted_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status == 200:
+                data = await response.json()
+                # Filter hanya Solana tokens
+                for token in data[:50]:  # Limit 50
+                    if token.get("chainId") == "solana":
+                        trending_tokens.append({
+                            "address": token.get("tokenAddress"),
+                            "source": "dexscreener_boost",
+                            "boost_amount": token.get("amount", 0),
+                        })
+    except Exception as e:
+        print(f"[HYPE] Error fetching DexScreener boosted: {e}")
+    
+    try:
+        # DexScreener Top Tokens by Volume (Solana)
+        top_url = "https://api.dexscreener.com/latest/dex/tokens/solana"
+        # Note: This endpoint might not exist, will fallback to search
+    except Exception as e:
+        print(f"[HYPE] Error fetching DexScreener top: {e}")
+    
+    return trending_tokens
+
+async def get_token_hype_data(token_address: str) -> Optional[Dict]:
+    """Get detailed token data including volume, txns, social dari DexScreener."""
+    global http_session
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+        async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if response.status != 200:
+                return None
+            
+            data = await response.json()
+            pairs = data.get("pairs") or []
+            
+            if not pairs:
+                return None
+            
+            # Aggregate data from all pairs (pilih pair Solana dengan liquidity terbesar)
+            solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+            if not solana_pairs:
+                return None
+            
+            # Sort by liquidity
+            solana_pairs.sort(key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)
+            best_pair = solana_pairs[0]
+            
+            # Get base token info
+            base_token = best_pair.get("baseToken", {})
+            
+            # Extract time-based metrics
+            volume_5m = float(best_pair.get("volume", {}).get("m5", 0) or 0)
+            volume_1h = float(best_pair.get("volume", {}).get("h1", 0) or 0)
+            volume_24h = float(best_pair.get("volume", {}).get("h24", 0) or 0)
+            
+            txns_5m = best_pair.get("txns", {}).get("m5", {})
+            txns_1h = best_pair.get("txns", {}).get("h1", {})
+            
+            buys_5m = int(txns_5m.get("buys", 0) or 0)
+            sells_5m = int(txns_5m.get("sells", 0) or 0)
+            total_txns_5m = buys_5m + sells_5m
+            
+            buys_1h = int(txns_1h.get("buys", 0) or 0)
+            sells_1h = int(txns_1h.get("sells", 0) or 0)
+            
+            # Price changes
+            price_change_5m = float(best_pair.get("priceChange", {}).get("m5", 0) or 0)
+            price_change_1h = float(best_pair.get("priceChange", {}).get("h1", 0) or 0)
+            price_change_24h = float(best_pair.get("priceChange", {}).get("h24", 0) or 0)
+            
+            # Market cap & liquidity
+            market_cap = float(best_pair.get("fdv", 0) or best_pair.get("marketCap", 0) or 0)
+            liquidity_usd = float(best_pair.get("liquidity", {}).get("usd", 0) or 0)
+            
+            # Token age (dari pairCreatedAt)
+            pair_created_at = best_pair.get("pairCreatedAt")
+            token_age_hours = None
+            if pair_created_at:
+                try:
+                    created_ts = int(pair_created_at) / 1000  # Convert ms to seconds
+                    token_age_hours = (time.time() - created_ts) / 3600
+                except:
+                    pass
+            
+            # Social info (if available)
+            info = best_pair.get("info", {})
+            socials = info.get("socials", [])
+            has_twitter = any(s.get("type") == "twitter" for s in socials)
+            has_telegram = any(s.get("type") == "telegram" for s in socials)
+            has_website = bool(info.get("websites"))
+            
+            # Calculate hype score
+            hype_score = 0
+            
+            # Volume score (0-30 points)
+            if volume_5m >= 100000:
+                hype_score += 30
+            elif volume_5m >= 50000:
+                hype_score += 20
+            elif volume_5m >= 25000:
+                hype_score += 10
+            
+            # Transaction count score (0-20 points)
+            if total_txns_5m >= 100:
+                hype_score += 20
+            elif total_txns_5m >= 50:
+                hype_score += 15
+            elif total_txns_5m >= 25:
+                hype_score += 10
+            
+            # Buy pressure score (0-20 points)
+            if total_txns_5m > 0:
+                buy_ratio = buys_5m / total_txns_5m
+                if buy_ratio >= 0.7:
+                    hype_score += 20
+                elif buy_ratio >= 0.6:
+                    hype_score += 15
+                elif buy_ratio >= 0.5:
+                    hype_score += 10
+            
+            # Price momentum score (0-15 points)
+            if 5 <= price_change_5m <= 30:
+                hype_score += 15
+            elif 0 < price_change_5m < 5:
+                hype_score += 5
+            
+            # Social presence score (0-15 points)
+            if has_twitter:
+                hype_score += 10
+            if has_telegram:
+                hype_score += 3
+            if has_website:
+                hype_score += 2
+            
+            return {
+                "address": token_address,
+                "name": base_token.get("name", "Unknown"),
+                "symbol": base_token.get("symbol", "???"),
+                "price_usd": float(best_pair.get("priceUsd", 0) or 0),
+                "market_cap": market_cap,
+                "liquidity_usd": liquidity_usd,
+                
+                # Volume metrics
+                "volume_5m": volume_5m,
+                "volume_1h": volume_1h,
+                "volume_24h": volume_24h,
+                
+                # Transaction metrics
+                "txns_5m": total_txns_5m,
+                "buys_5m": buys_5m,
+                "sells_5m": sells_5m,
+                "buys_1h": buys_1h,
+                "sells_1h": sells_1h,
+                "buy_ratio_5m": buys_5m / total_txns_5m if total_txns_5m > 0 else 0,
+                
+                # Price changes
+                "price_change_5m": price_change_5m,
+                "price_change_1h": price_change_1h,
+                "price_change_24h": price_change_24h,
+                
+                # Token info
+                "token_age_hours": token_age_hours,
+                "has_twitter": has_twitter,
+                "has_telegram": has_telegram,
+                "has_website": has_website,
+                
+                # Calculated scores
+                "hype_score": hype_score,
+                
+                # Pair info
+                "pair_address": best_pair.get("pairAddress"),
+                "dex_id": best_pair.get("dexId"),
+            }
+            
+    except Exception as e:
+        print(f"[HYPE] Error fetching token data for {token_address[:8]}...: {e}")
+        return None
+
+async def check_kol_buys(token_address: str, time_window_minutes: int = 5) -> List[Dict]:
+    """Check if any KOL wallets bought this token recently."""
+    if not TRADING_CONFIG.get("kol_tracking_enabled") or not KOL_WALLETS:
+        return []
+    
+    kol_buys = []
+    min_sol = TRADING_CONFIG.get("kol_buy_min_sol", 1)
+    
+    # This would require checking recent transactions for each KOL wallet
+    # For efficiency, we can use Helius to batch check
+    # For now, return empty - this is a placeholder for advanced implementation
+    
+    # TODO: Implement KOL buy checking via Helius API
+    # 1. For each KOL wallet, fetch recent SWAP transactions
+    # 2. Check if any swap involves the target token
+    # 3. Return list of KOL buys with details
+    
+    return kol_buys
+
+def token_meets_hype_criteria(hype_data: Dict) -> Tuple[bool, List[str]]:
+    """Check if token meets all hype trading criteria. Returns (passed, reasons)."""
+    reasons = []
+    
+    cfg = TRADING_CONFIG
+    
+    # Volume check (5 menit)
+    volume_5m = hype_data.get("volume_5m", 0)
+    min_vol_5m = cfg.get("min_volume_5m_usd", 50000)
+    if volume_5m < min_vol_5m:
+        reasons.append(f"Volume 5m ${volume_5m:,.0f} < ${min_vol_5m:,.0f}")
+    
+    # Transaction count check
+    txns_5m = hype_data.get("txns_5m", 0)
+    min_txns = cfg.get("min_txns_5m", 50)
+    if txns_5m < min_txns:
+        reasons.append(f"Txns 5m {txns_5m} < {min_txns}")
+    
+    # Buyers check
+    buys_5m = hype_data.get("buys_5m", 0)
+    min_buyers = cfg.get("min_buyers_5m", 30)
+    if buys_5m < min_buyers:
+        reasons.append(f"Buyers 5m {buys_5m} < {min_buyers}")
+    
+    # Price change check
+    price_change_5m = hype_data.get("price_change_5m", 0)
+    min_price = cfg.get("min_price_change_5m", 5)
+    max_price = cfg.get("max_price_change_5m", 50)
+    if price_change_5m < min_price:
+        reasons.append(f"Price change 5m {price_change_5m:.1f}% < {min_price}%")
+    if price_change_5m > max_price:
+        reasons.append(f"Price change 5m {price_change_5m:.1f}% > {max_price}% (pump risk)")
+    
+    # Market cap check
+    market_cap = hype_data.get("market_cap", 0)
+    min_mcap = cfg.get("hype_min_mcap", 100000)
+    max_mcap = cfg.get("hype_max_mcap", 5000000)
+    if market_cap < min_mcap:
+        reasons.append(f"MCap ${market_cap:,.0f} < ${min_mcap:,.0f}")
+    if market_cap > max_mcap:
+        reasons.append(f"MCap ${market_cap:,.0f} > ${max_mcap:,.0f}")
+    
+    # Liquidity check
+    liquidity = hype_data.get("liquidity_usd", 0)
+    min_liq = cfg.get("min_liquidity_usd", 5000)
+    if liquidity < min_liq:
+        reasons.append(f"Liquidity ${liquidity:,.0f} < ${min_liq:,.0f}")
+    
+    # Token age check
+    token_age = hype_data.get("token_age_hours")
+    if token_age is not None:
+        max_age = cfg.get("max_token_age_hours", 72)
+        min_age_min = cfg.get("min_token_age_minutes", 5)
+        if token_age > max_age:
+            reasons.append(f"Token age {token_age:.1f}h > {max_age}h")
+        if token_age * 60 < min_age_min:
+            reasons.append(f"Token too new ({token_age*60:.1f}min < {min_age_min}min)")
+    
+    # Buy pressure check (optional but helpful)
+    buy_ratio = hype_data.get("buy_ratio_5m", 0)
+    if buy_ratio < 0.5:
+        reasons.append(f"Low buy pressure ({buy_ratio:.0%} buyers)")
+    
+    passed = len(reasons) == 0
+    return passed, reasons
+
+async def scan_for_hype_tokens() -> List[Dict]:
+    """Scan for tokens that meet hype criteria."""
+    global http_session
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    qualifying_tokens = []
+    
+    try:
+        # Method 1: Scan DexScreener boosted tokens
+        boosted = await fetch_trending_tokens_dexscreener()
+        
+        # Method 2: Get token profiles with recent activity
+        # DexScreener token profiles API
+        profiles_url = "https://api.dexscreener.com/token-profiles/latest/v1"
+        try:
+            async with http_session.get(profiles_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status == 200:
+                    profiles = await response.json()
+                    for profile in profiles[:30]:  # Limit
+                        if profile.get("chainId") == "solana":
+                            token_addr = profile.get("tokenAddress")
+                            if token_addr and token_addr not in [t.get("address") for t in boosted]:
+                                boosted.append({
+                                    "address": token_addr,
+                                    "source": "dexscreener_profile"
+                                })
+        except Exception as e:
+            print(f"[HYPE] Error fetching profiles: {e}")
+        
+        print(f"[HYPE] Scanning {len(boosted)} potential tokens...")
+        
+        # Check each token
+        for token_info in boosted[:20]:  # Limit to prevent rate limiting
+            token_address = token_info.get("address")
+            if not token_address:
+                continue
+            
+            # Skip if already traded today
+            today = datetime.now().strftime("%Y-%m-%d")
+            if hype_traded_tokens.get(token_address) == today:
+                continue
+            
+            # Skip if already in position
+            if token_address in active_positions:
+                continue
+            
+            # Get detailed hype data
+            hype_data = await get_token_hype_data(token_address)
+            if not hype_data:
+                continue
+            
+            # Check criteria
+            passed, reasons = token_meets_hype_criteria(hype_data)
+            
+            symbol = hype_data.get("symbol", "???")
+            
+            if passed:
+                print(f"[HYPE] ✅ {symbol} QUALIFIES! Score: {hype_data.get('hype_score', 0)}")
+                print(f"       Volume 5m: ${hype_data.get('volume_5m', 0):,.0f}")
+                print(f"       Txns 5m: {hype_data.get('txns_5m', 0)} (buys: {hype_data.get('buys_5m', 0)})")
+                print(f"       Price 5m: {hype_data.get('price_change_5m', 0):+.1f}%")
+                qualifying_tokens.append(hype_data)
+            else:
+                if hype_data.get("volume_5m", 0) >= 10000:  # Only log tokens with some activity
+                    print(f"[HYPE] ❌ {symbol} failed: {', '.join(reasons[:2])}")
+            
+            # Small delay to avoid rate limiting
+            await asyncio.sleep(0.5)
+        
+        # Sort by hype score
+        qualifying_tokens.sort(key=lambda x: x.get("hype_score", 0), reverse=True)
+        
+    except Exception as e:
+        print(f"[HYPE] Error in scan_for_hype_tokens: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return qualifying_tokens
+
+async def execute_hype_trade(hype_data: Dict) -> Tuple[bool, str]:
+    """Execute trade for a qualifying hype token. Supports DRY RUN mode."""
+    token_address = hype_data.get("address")
+    token_name = hype_data.get("name", "Unknown")
+    token_symbol = hype_data.get("symbol", "???")
+    
+    # Check DRY RUN mode
+    is_dry_run = TRADING_CONFIG.get("dry_run", True)
+    
+    if is_dry_run:
+        # DRY RUN: Simulate trade without actually executing
+        print(f"[DRY RUN] 🧪 Would trade {token_symbol} with {TRADING_CONFIG.get('max_position_sol', 0.5)} SOL")
+        
+        # Mark as "traded" for today (to avoid repeated notifications)
+        today = datetime.now().strftime("%Y-%m-%d")
+        hype_traded_tokens[token_address] = today
+        save_hype_state()
+        
+        # Store detection data for reference
+        hype_detected_tokens[token_address] = {
+            **hype_data,
+            "detected_at": time.time(),
+            "traded": False,  # Not actually traded
+            "dry_run": True
+        }
+        save_hype_state()
+        
+        return True, "DRY_RUN_SIMULATED"
+    
+    # REAL TRADE: Open position
+    amount_sol = TRADING_CONFIG.get("max_position_sol", 0.5)
+    
+    success, result = await open_trading_position(
+        token_address=token_address,
+        amount_sol=amount_sol,
+        token_name=token_name,
+        token_symbol=token_symbol
+    )
+    
+    if success:
+        # Mark as traded today
+        today = datetime.now().strftime("%Y-%m-%d")
+        hype_traded_tokens[token_address] = today
+        save_hype_state()
+        
+        # Store detection data for reference
+        hype_detected_tokens[token_address] = {
+            **hype_data,
+            "detected_at": time.time(),
+            "traded": True,
+            "dry_run": False
+        }
+        save_hype_state()
+    
+    return success, result
+
+async def send_hype_notification(hype_data: Dict, trade_result: str = None, is_dry_run: bool = False):
+    """Send notification about hype token detection/trade."""
+    channel = bot.get_channel(TRADING_CHANNEL_ID) or bot.get_channel(BOT_CALL_CHANNEL_ID)
+    if not channel:
+        return
+    
+    token_address = hype_data.get("address", "")
+    symbol = hype_data.get("symbol", "???")
+    name = hype_data.get("name", "Unknown")
+    
+    # Check dry run mode
+    is_dry_run = is_dry_run or TRADING_CONFIG.get("dry_run", True) or trade_result == "DRY_RUN_SIMULATED"
+    
+    if trade_result and not is_dry_run:
+        title = f"🔥 HYPE TRADE: {symbol}"
+        color = 0xff6b00  # Orange
+        desc = f"**{name}** (`{symbol}`)\n\nAuto-traded based on hype signals!"
+    elif trade_result and is_dry_run:
+        title = f"🧪 [DRY RUN] HYPE DETECTED: {symbol}"
+        color = 0x9b59b6  # Purple for dry run
+        desc = f"**{name}** (`{symbol}`)\n\n⚠️ **DRY RUN MODE** - Trade TIDAK dieksekusi!\nIni hanya simulasi untuk testing."
+    else:
+        title = f"🔥 HYPE DETECTED: {symbol}"
+        color = 0xffaa00  # Yellow
+        desc = f"**{name}** (`{symbol}`)\n\nToken showing strong hype signals!"
+    
+    embed = discord.Embed(
+        title=title,
+        description=desc,
+        color=color,
+        timestamp=datetime.utcnow()
+    )
+    
+    # Volume & Activity
+    embed.add_field(
+        name="📊 Volume (5min)",
+        value=f"${hype_data.get('volume_5m', 0):,.0f}",
+        inline=True
+    )
+    embed.add_field(
+        name="💹 Txns (5min)",
+        value=f"{hype_data.get('txns_5m', 0)} ({hype_data.get('buys_5m', 0)} buys)",
+        inline=True
+    )
+    embed.add_field(
+        name="📈 Price (5min)",
+        value=f"{hype_data.get('price_change_5m', 0):+.1f}%",
+        inline=True
+    )
+    
+    # Market data
+    embed.add_field(
+        name="💰 Market Cap",
+        value=_format_usd(hype_data.get("market_cap")),
+        inline=True
+    )
+    embed.add_field(
+        name="💧 Liquidity",
+        value=_format_usd(hype_data.get("liquidity_usd")),
+        inline=True
+    )
+    embed.add_field(
+        name="🎯 Hype Score",
+        value=f"{hype_data.get('hype_score', 0)}/100",
+        inline=True
+    )
+    
+    # Social indicators
+    social_parts = []
+    if hype_data.get("has_twitter"):
+        social_parts.append("✅ Twitter")
+    if hype_data.get("has_telegram"):
+        social_parts.append("✅ Telegram")
+    if hype_data.get("has_website"):
+        social_parts.append("✅ Website")
+    social_str = " | ".join(social_parts) if social_parts else "❌ No socials"
+    embed.add_field(name="🌐 Socials", value=social_str, inline=False)
+    
+    # Links
+    links = (
+        f"[DexScreener](https://dexscreener.com/solana/{token_address}) | "
+        f"[Jupiter](https://jup.ag/swap/SOL-{token_address}) | "
+        f"[GMGN](https://gmgn.ai/sol/token/{token_address})"
+    )
+    embed.add_field(name="🔗 Links", value=links, inline=False)
+    
+    if trade_result:
+        embed.add_field(name="📝 Tx", value=f"`{trade_result[:20]}...`", inline=False)
+    
+    embed.set_footer(text=f"Token: {token_address[:12]}...")
+    
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"[HYPE] Failed to send notification: {e}")
+
 # --- DATA STORAGE UNTUK TRACKED WALLETS (per user) ---
 TRACKED_WALLETS_FILE = 'tracked_wallets.json'
 tracked_wallets = {}  # {user_id: {wallet: {'alias': 'nama', 'last_sig': None}}}
@@ -1269,6 +2338,13 @@ async def send_bot_call_notification(token_data: Dict[str, object]):
         bot_call_notified_tokens[token_address] = today
         save_bot_call_state()
         
+        # Trigger auto-trade if enabled
+        if TRADING_ENABLED and TRADING_CONFIG.get("auto_trade_from_bot_call"):
+            try:
+                await auto_trade_from_bot_call(token_data)
+            except Exception as trade_error:
+                print(f"[TRADING] Auto-trade failed for {token_symbol}: {trade_error}")
+        
     except Exception as e:
         print(f"[ERROR] Failed to send bot call notification: {e}")
         import traceback
@@ -1426,6 +2502,205 @@ async def trigger_bot_call_manual():
         import traceback
         traceback.print_exc()
         return False, error_msg
+
+# ============================================================================
+# --- TRADING BOT: BACKGROUND TASK & COMMANDS ---
+# ============================================================================
+
+@tasks.loop(seconds=15)  # Check every 15 seconds (configurable via TRADING_CHECK_INTERVAL)
+async def monitor_trading_positions():
+    """Background task to monitor active trading positions and auto-sell at TP/SL."""
+    if not TRADING_ENABLED or not active_positions:
+        return
+    
+    now = time.time()
+    positions_to_close = []
+    
+    for token_address, position in list(active_positions.items()):
+        try:
+            # Get current price
+            current_price = await get_token_price(token_address)
+            if not current_price:
+                print(f"[TRADING] Could not get price for {position['token_symbol']}, skipping check")
+                continue
+            
+            entry_price = position["entry_price_usd"]
+            price_change_percent = ((current_price - entry_price) / entry_price) * 100
+            
+            close_reason = None
+            
+            # Check Take Profit
+            if current_price >= position["take_profit_price"]:
+                close_reason = f"take_profit ({price_change_percent:+.2f}%)"
+                print(f"[TRADING] 🎯 TP HIT! {position['token_symbol']} at {price_change_percent:+.2f}%")
+            
+            # Check Stop Loss
+            elif current_price <= position["stop_loss_price"]:
+                close_reason = f"stop_loss ({price_change_percent:+.2f}%)"
+                print(f"[TRADING] 🛑 SL HIT! {position['token_symbol']} at {price_change_percent:+.2f}%")
+            
+            # Check Max Hold Time
+            elif now >= position["max_hold_until"]:
+                close_reason = f"timeout ({price_change_percent:+.2f}%)"
+                hold_minutes = (now - position["entry_time"]) / 60
+                print(f"[TRADING] ⏰ TIMEOUT! {position['token_symbol']} after {hold_minutes:.1f} min at {price_change_percent:+.2f}%")
+            
+            if close_reason:
+                positions_to_close.append((token_address, close_reason))
+            else:
+                # Log position status periodically
+                hold_seconds = now - position["entry_time"]
+                if hold_seconds % 60 < 20:  # Log every ~minute
+                    print(f"[TRADING] 📊 {position['token_symbol']}: {price_change_percent:+.2f}% | TP: {TRADING_CONFIG['take_profit_percent']}% | SL: -{TRADING_CONFIG['stop_loss_percent']}%")
+                    
+        except Exception as e:
+            print(f"[TRADING] Error monitoring {token_address[:8]}...: {e}")
+    
+    # Close positions that hit TP/SL/Timeout
+    for token_address, reason in positions_to_close:
+        try:
+            position = active_positions.get(token_address)
+            if not position:
+                continue
+                
+            success, message, pnl = await close_trading_position(token_address, reason)
+            
+            if success:
+                # Send notification
+                if pnl and pnl >= 0:
+                    title = "🎯 Take Profit Hit!" if "take_profit" in reason else "⏰ Position Closed"
+                    color = 0x00ff00  # Green
+                else:
+                    title = "🛑 Stop Loss Hit!" if "stop_loss" in reason else "📉 Position Closed"
+                    color = 0xff0000  # Red
+                
+                await send_trading_notification(
+                    title=title,
+                    description=f"Position closed: **{reason}**\nTx: `{message[:16]}...`",
+                    color=color,
+                    position=position,
+                    pnl=pnl
+                )
+            else:
+                print(f"[TRADING] Failed to close position: {message}")
+                
+        except Exception as e:
+            print(f"[TRADING] Error closing position {token_address[:8]}...: {e}")
+            import traceback
+            traceback.print_exc()
+
+@monitor_trading_positions.before_loop
+async def before_monitor_trading():
+    """Wait for bot to be ready before starting trading monitor."""
+    await bot.wait_until_ready()
+    # Load positions on startup
+    load_trading_positions()
+    load_trading_history()
+    print("[TRADING] Position monitor started")
+
+async def auto_trade_from_bot_call(token_data: Dict):
+    """Automatically open a trade when bot call detects a new token."""
+    if not TRADING_ENABLED or not TRADING_CONFIG.get("auto_trade_from_bot_call"):
+        return
+    
+    token_address = token_data.get("address")
+    token_name = token_data.get("name", "Unknown")
+    token_symbol = token_data.get("symbol", "UNKNOWN")
+    liquidity = token_data.get("liquidity_usd", 0)
+    
+    # Check minimum liquidity
+    if liquidity and liquidity < TRADING_CONFIG["min_liquidity_usd"]:
+        print(f"[TRADING] Skip auto-trade for {token_symbol}: liquidity ${liquidity:.0f} < min ${TRADING_CONFIG['min_liquidity_usd']:.0f}")
+        return
+    
+    # Open position with configured amount
+    amount_sol = TRADING_CONFIG["max_position_sol"]
+    
+    print(f"[TRADING] 🤖 Auto-trading {token_symbol} with {amount_sol} SOL...")
+    
+    success, result = await open_trading_position(
+        token_address=token_address,
+        amount_sol=amount_sol,
+        token_name=token_name,
+        token_symbol=token_symbol
+    )
+    
+    if success:
+        position = active_positions.get(token_address)
+        await send_trading_notification(
+            title=f"🛒 Auto-Buy: {token_symbol}",
+            description=f"Position opened automatically from bot call\nTx: `{result[:16]}...`",
+            color=0x3498db,
+            position=position
+        )
+    else:
+        print(f"[TRADING] Auto-trade failed for {token_symbol}: {result}")
+
+# ============================================================================
+# --- HYPE TRADING: BACKGROUND SCANNER TASK ---
+# ============================================================================
+
+@tasks.loop(seconds=60)  # Scan setiap 60 detik (configurable via HYPE_SCAN_INTERVAL)
+async def scan_hype_tokens():
+    """Background task untuk scan token dengan volume spike dan hype signals."""
+    if not TRADING_ENABLED or not TRADING_CONFIG.get("hype_trading_enabled"):
+        return
+    
+    # Check daily loss limit
+    reset_daily_pnl_if_needed()
+    if daily_pnl <= -TRADING_CONFIG.get("daily_loss_limit_sol", 2):
+        return
+    
+    # Check max concurrent positions
+    if len(active_positions) >= TRADING_CONFIG.get("max_concurrent_positions", 3):
+        return
+    
+    try:
+        print(f"[HYPE] 🔍 Scanning for hype tokens...")
+        qualifying_tokens = await scan_for_hype_tokens()
+        
+        if not qualifying_tokens:
+            print(f"[HYPE] No qualifying tokens found")
+            return
+        
+        print(f"[HYPE] Found {len(qualifying_tokens)} qualifying token(s)")
+        
+        # Trade the best token (highest hype score)
+        best_token = qualifying_tokens[0]
+        symbol = best_token.get("symbol", "???")
+        
+        is_dry_run = TRADING_CONFIG.get("dry_run", True)
+        dry_run_tag = "[DRY RUN] " if is_dry_run else ""
+        
+        print(f"[HYPE] {dry_run_tag}🔥 Best token: {symbol} (score: {best_token.get('hype_score', 0)})")
+        
+        # Execute trade (or simulate if dry run)
+        success, result = await execute_hype_trade(best_token)
+        
+        if success:
+            if is_dry_run:
+                print(f"[HYPE] 🧪 DRY RUN: Would have traded {symbol} (simulated)")
+            else:
+                print(f"[HYPE] ✅ Successfully traded {symbol}!")
+            await send_hype_notification(best_token, trade_result=result, is_dry_run=is_dry_run)
+        else:
+            print(f"[HYPE] ❌ Trade failed for {symbol}: {result}")
+            # Still send notification about detection (without trade)
+            await send_hype_notification(best_token, is_dry_run=is_dry_run)
+            
+    except Exception as e:
+        print(f"[HYPE] Error in scan_hype_tokens: {e}")
+        import traceback
+        traceback.print_exc()
+
+@scan_hype_tokens.before_loop
+async def before_scan_hype():
+    """Wait for bot to be ready before starting hype scanner."""
+    await bot.wait_until_ready()
+    # Load hype state and KOL wallets
+    load_hype_state()
+    load_kol_wallets()
+    print("[HYPE] Hype scanner ready")
 
 # --- HELPER: FETCH RECENT SWAPS FROM HELIUS ---
 async def fetch_recent_swaps(wallet: str, max_retries: int = 2) -> List[Dict]:
@@ -2101,6 +3376,24 @@ async def on_ready():
     if not auto_archive_threads.is_running():
         auto_archive_threads.start()
         print("[DEBUG] Thread auto-archive task started (15 menit)")
+    
+    # Start trading position monitor task if trading is enabled
+    if TRADING_ENABLED:
+        if not monitor_trading_positions.is_running():
+            monitor_trading_positions.start()
+            print(f"[TRADING] Position monitor started (check every {TRADING_CONFIG['price_check_interval_sec']}s)")
+            print(f"[TRADING] Config: TP={TRADING_CONFIG['take_profit_percent']}%, SL={TRADING_CONFIG['stop_loss_percent']}%, Max={TRADING_CONFIG['max_position_sol']} SOL")
+        
+        # Start hype scanner if enabled
+        if TRADING_CONFIG.get("hype_trading_enabled"):
+            if not scan_hype_tokens.is_running():
+                scan_hype_tokens.start()
+                print(f"[HYPE] Hype scanner started (scan every {TRADING_CONFIG.get('hype_scan_interval_sec', 60)}s)")
+                print(f"[HYPE] Config: Vol5m>=${TRADING_CONFIG.get('min_volume_5m_usd', 50000):,.0f}, Txns>={TRADING_CONFIG.get('min_txns_5m', 50)}, Price5m>={TRADING_CONFIG.get('min_price_change_5m', 5)}%")
+        else:
+            print("[HYPE] Hype trading DISABLED - set HYPE_TRADING_ENABLED=true to enable")
+    else:
+        print("[TRADING] Trading bot DISABLED - set TRADING_ENABLED=true to enable")
 
 # --- EVENT: MEMBER BARU JOIN ---
 @bot.event
@@ -2424,6 +3717,682 @@ async def botcall_test(interaction: discord.Interaction):
             await interaction.followup.send(f"❌ {message}", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+# ============================================================================
+# --- TRADING BOT SLASH COMMANDS ---
+# ============================================================================
+
+def _trading_admin_check(interaction: discord.Interaction) -> bool:
+    """Check if user can use trading commands (admin/moderator only)."""
+    if _user_can_run_admin_actions(interaction.user):
+        return True
+    raise app_commands.CheckFailure("Kamu butuh izin Admin untuk menggunakan trading commands.")
+
+@bot.tree.command(name="trade_buy", description="🛒 Beli token dengan SOL (ADMIN ONLY)")
+@app_commands.describe(
+    token_address="Solana token address untuk dibeli",
+    amount_sol="Jumlah SOL untuk trading (default: max position)",
+    token_symbol="Symbol token (opsional)"
+)
+@app_commands.check(_trading_admin_check)
+async def trade_buy(
+    interaction: discord.Interaction,
+    token_address: str,
+    amount_sol: Optional[float] = None,
+    token_symbol: Optional[str] = None
+):
+    """Open a trading position (buy token with SOL)."""
+    if not TRADING_ENABLED:
+        await interaction.response.send_message("❌ Trading bot DISABLED. Set TRADING_ENABLED=true untuk mengaktifkan.", ephemeral=True)
+        return
+    
+    if not is_valid_solana_address(token_address):
+        await interaction.response.send_message("❌ Invalid Solana token address!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        # Use max position if amount not specified
+        if amount_sol is None:
+            amount_sol = TRADING_CONFIG["max_position_sol"]
+        
+        # Get token metadata
+        token_info = await fetch_token_metadata(token_address)
+        token_name = token_info.get("name") or "Unknown"
+        symbol = token_symbol or token_info.get("symbol") or "???"
+        
+        success, result = await open_trading_position(
+            token_address=token_address,
+            amount_sol=amount_sol,
+            token_name=token_name,
+            token_symbol=symbol
+        )
+        
+        if success:
+            position = active_positions.get(token_address)
+            embed = discord.Embed(
+                title=f"🛒 Position Opened: {symbol}",
+                description=f"Berhasil beli **{symbol}** dengan **{amount_sol:.4f} SOL**",
+                color=0x00ff00,
+                timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="Token", value=f"**{token_name}**\n`{token_address[:12]}...`", inline=True)
+            embed.add_field(name="Amount", value=f"{amount_sol:.4f} SOL", inline=True)
+            embed.add_field(name="Entry Price", value=f"${position['entry_price_usd']:.8f}", inline=True)
+            embed.add_field(name="Take Profit", value=f"+{TRADING_CONFIG['take_profit_percent']}%\n(${position['take_profit_price']:.8f})", inline=True)
+            embed.add_field(name="Stop Loss", value=f"-{TRADING_CONFIG['stop_loss_percent']}%\n(${position['stop_loss_price']:.8f})", inline=True)
+            embed.add_field(name="Max Hold", value=f"{TRADING_CONFIG['max_hold_minutes']} min", inline=True)
+            embed.add_field(name="Tx", value=f"[View on Solscan](https://solscan.io/tx/{result})", inline=False)
+            embed.set_footer(text=f"Positions: {len(active_positions)}/{TRADING_CONFIG['max_concurrent_positions']}")
+            
+            await interaction.followup.send(embed=embed)
+            
+            # Also notify trading channel
+            await send_trading_notification(
+                title=f"🛒 New Position: {symbol}",
+                description=f"Opened by {interaction.user.mention}\nTx: `{result[:16]}...`",
+                color=0x00ff00,
+                position=position
+            )
+        else:
+            await interaction.followup.send(f"❌ Gagal beli: {result}")
+            
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+@bot.tree.command(name="trade_sell", description="💰 Jual posisi trading (ADMIN ONLY)")
+@app_commands.describe(
+    token_address="Solana token address untuk dijual",
+)
+@app_commands.check(_trading_admin_check)
+async def trade_sell(interaction: discord.Interaction, token_address: str):
+    """Close a trading position (sell token for SOL)."""
+    if not TRADING_ENABLED:
+        await interaction.response.send_message("❌ Trading bot DISABLED.", ephemeral=True)
+        return
+    
+    if token_address not in active_positions:
+        await interaction.response.send_message("❌ Tidak ada posisi aktif untuk token ini!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        position = active_positions.get(token_address)
+        symbol = position.get("token_symbol", "???")
+        
+        success, result, pnl = await close_trading_position(token_address, "manual")
+        
+        if success:
+            pnl_emoji = "🟢" if pnl and pnl >= 0 else "🔴"
+            pnl_str = f"{pnl:+.4f} SOL" if pnl is not None else "N/A"
+            pnl_percent = (pnl / position["entry_amount_sol"]) * 100 if pnl and position.get("entry_amount_sol") else 0
+            
+            embed = discord.Embed(
+                title=f"💰 Position Closed: {symbol}",
+                description=f"Berhasil jual **{symbol}**",
+                color=0x00ff00 if pnl and pnl >= 0 else 0xff0000,
+                timestamp=datetime.utcnow()
+            )
+            embed.add_field(name="P&L", value=f"{pnl_emoji} {pnl_str}\n({pnl_percent:+.2f}%)", inline=True)
+            embed.add_field(name="Entry", value=f"{position['entry_amount_sol']:.4f} SOL", inline=True)
+            embed.add_field(name="Daily P&L", value=f"{daily_pnl:+.4f} SOL", inline=True)
+            embed.add_field(name="Tx", value=f"[View on Solscan](https://solscan.io/tx/{result})", inline=False)
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(f"❌ Gagal jual: {result}")
+            
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+@bot.tree.command(name="trade_positions", description="📊 Lihat semua posisi trading aktif")
+async def trade_positions(interaction: discord.Interaction):
+    """View all active trading positions."""
+    if not TRADING_ENABLED:
+        await interaction.response.send_message("❌ Trading bot DISABLED.", ephemeral=True)
+        return
+    
+    if not active_positions:
+        await interaction.response.send_message("📭 Tidak ada posisi aktif saat ini.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        embed = discord.Embed(
+            title="📊 Active Trading Positions",
+            description=f"Total: **{len(active_positions)}** posisi aktif",
+            color=0x3498db,
+            timestamp=datetime.utcnow()
+        )
+        
+        for token_address, position in active_positions.items():
+            symbol = position.get("token_symbol", "???")
+            entry_price = position.get("entry_price_usd", 0)
+            entry_sol = position.get("entry_amount_sol", 0)
+            entry_time = position.get("entry_time", 0)
+            
+            # Get current price
+            current_price = await get_token_price(token_address)
+            if current_price:
+                pnl_percent = ((current_price - entry_price) / entry_price) * 100
+                pnl_emoji = "🟢" if pnl_percent >= 0 else "🔴"
+                price_str = f"${current_price:.8f} ({pnl_emoji} {pnl_percent:+.2f}%)"
+            else:
+                price_str = f"${entry_price:.8f} (current: N/A)"
+            
+            hold_minutes = (time.time() - entry_time) / 60
+            remaining_minutes = max(0, TRADING_CONFIG["max_hold_minutes"] - hold_minutes)
+            
+            field_value = (
+                f"**Entry:** {entry_sol:.4f} SOL @ ${entry_price:.8f}\n"
+                f"**Current:** {price_str}\n"
+                f"**TP:** +{TRADING_CONFIG['take_profit_percent']}% | **SL:** -{TRADING_CONFIG['stop_loss_percent']}%\n"
+                f"**Hold:** {hold_minutes:.1f} min ({remaining_minutes:.0f} min left)\n"
+                f"`{token_address[:12]}...`"
+            )
+            
+            embed.add_field(name=f"💎 {symbol}", value=field_value, inline=False)
+        
+        embed.set_footer(text=f"Daily P&L: {daily_pnl:+.4f} SOL | Max positions: {TRADING_CONFIG['max_concurrent_positions']}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="trade_history", description="📜 Lihat history trading (closed positions)")
+@app_commands.describe(limit="Jumlah trade terakhir yang ditampilkan (default: 10)")
+async def trade_history_cmd(interaction: discord.Interaction, limit: int = 10):
+    """View trading history."""
+    if not TRADING_ENABLED:
+        await interaction.response.send_message("❌ Trading bot DISABLED.", ephemeral=True)
+        return
+    
+    if not trading_history:
+        await interaction.response.send_message("📭 Belum ada history trading.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # Get last N trades
+        recent_trades = trading_history[-limit:][::-1]  # Newest first
+        
+        total_pnl = sum(t.get("pnl_sol", 0) for t in trading_history)
+        wins = sum(1 for t in trading_history if t.get("pnl_sol", 0) >= 0)
+        losses = len(trading_history) - wins
+        win_rate = (wins / len(trading_history)) * 100 if trading_history else 0
+        
+        embed = discord.Embed(
+            title="📜 Trading History",
+            description=(
+                f"**Total Trades:** {len(trading_history)}\n"
+                f"**Win Rate:** {win_rate:.1f}% ({wins}W / {losses}L)\n"
+                f"**Total P&L:** {total_pnl:+.4f} SOL"
+            ),
+            color=0x00ff00 if total_pnl >= 0 else 0xff0000,
+            timestamp=datetime.utcnow()
+        )
+        
+        for trade in recent_trades[:5]:  # Show max 5 in embed
+            symbol = trade.get("token_symbol", "???")
+            pnl = trade.get("pnl_sol", 0)
+            pnl_percent = trade.get("pnl_percent", 0)
+            reason = trade.get("close_reason", "unknown")
+            exit_time = trade.get("exit_time", 0)
+            
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            time_str = datetime.fromtimestamp(exit_time).strftime("%m/%d %H:%M") if exit_time else "N/A"
+            
+            embed.add_field(
+                name=f"{pnl_emoji} {symbol}",
+                value=f"**P&L:** {pnl:+.4f} SOL ({pnl_percent:+.2f}%)\n**Reason:** {reason}\n**Time:** {time_str}",
+                inline=True
+            )
+        
+        embed.set_footer(text=f"Showing last {len(recent_trades)} trades")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="trade_config", description="⚙️ Lihat/ubah konfigurasi trading")
+@app_commands.describe(
+    take_profit="Target take profit % (kosongkan untuk lihat saja)",
+    stop_loss="Stop loss % (kosongkan untuk lihat saja)",
+    max_sol="Max SOL per trade (kosongkan untuk lihat saja)",
+    max_hold="Max hold time dalam menit (kosongkan untuk lihat saja)"
+)
+@app_commands.check(_trading_admin_check)
+async def trade_config_cmd(
+    interaction: discord.Interaction,
+    take_profit: Optional[float] = None,
+    stop_loss: Optional[float] = None,
+    max_sol: Optional[float] = None,
+    max_hold: Optional[int] = None
+):
+    """View or update trading configuration."""
+    if not TRADING_ENABLED:
+        await interaction.response.send_message("❌ Trading bot DISABLED.", ephemeral=True)
+        return
+    
+    # Update config if any parameter provided
+    updated = []
+    if take_profit is not None and take_profit > 0:
+        TRADING_CONFIG["take_profit_percent"] = take_profit
+        updated.append(f"Take Profit: {take_profit}%")
+    
+    if stop_loss is not None and stop_loss > 0:
+        TRADING_CONFIG["stop_loss_percent"] = stop_loss
+        updated.append(f"Stop Loss: {stop_loss}%")
+    
+    if max_sol is not None and max_sol > 0:
+        TRADING_CONFIG["max_position_sol"] = max_sol
+        updated.append(f"Max Position: {max_sol} SOL")
+    
+    if max_hold is not None and max_hold > 0:
+        TRADING_CONFIG["max_hold_minutes"] = max_hold
+        updated.append(f"Max Hold: {max_hold} min")
+    
+    embed = discord.Embed(
+        title="⚙️ Trading Configuration",
+        color=0x9b59b6,
+        timestamp=datetime.utcnow()
+    )
+    
+    embed.add_field(name="Take Profit", value=f"+{TRADING_CONFIG['take_profit_percent']}%", inline=True)
+    embed.add_field(name="Stop Loss", value=f"-{TRADING_CONFIG['stop_loss_percent']}%", inline=True)
+    embed.add_field(name="Max Position", value=f"{TRADING_CONFIG['max_position_sol']} SOL", inline=True)
+    embed.add_field(name="Max Concurrent", value=f"{TRADING_CONFIG['max_concurrent_positions']} positions", inline=True)
+    embed.add_field(name="Max Hold Time", value=f"{TRADING_CONFIG['max_hold_minutes']} min", inline=True)
+    embed.add_field(name="Slippage", value=f"{TRADING_CONFIG['slippage_bps'] / 100}%", inline=True)
+    embed.add_field(name="Daily Loss Limit", value=f"{TRADING_CONFIG['daily_loss_limit_sol']} SOL", inline=True)
+    embed.add_field(name="Auto Trade", value="✅ ON" if TRADING_CONFIG.get("auto_trade_from_bot_call") else "❌ OFF", inline=True)
+    embed.add_field(name="Min Liquidity", value=f"${TRADING_CONFIG['min_liquidity_usd']:,.0f}", inline=True)
+    
+    if updated:
+        embed.description = f"✅ **Updated:** {', '.join(updated)}"
+    
+    embed.set_footer(text=f"Active positions: {len(active_positions)} | Daily P&L: {daily_pnl:+.4f} SOL")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="trade_toggle_auto", description="🔄 Toggle auto-trade dari bot call ON/OFF")
+@app_commands.check(_trading_admin_check)
+async def trade_toggle_auto(interaction: discord.Interaction):
+    """Toggle auto-trading from bot call notifications."""
+    if not TRADING_ENABLED:
+        await interaction.response.send_message("❌ Trading bot DISABLED.", ephemeral=True)
+        return
+    
+    current = TRADING_CONFIG.get("auto_trade_from_bot_call", False)
+    TRADING_CONFIG["auto_trade_from_bot_call"] = not current
+    new_state = TRADING_CONFIG["auto_trade_from_bot_call"]
+    
+    emoji = "✅" if new_state else "❌"
+    status = "ON" if new_state else "OFF"
+    
+    await interaction.response.send_message(
+        f"{emoji} Auto-trade dari bot call sekarang **{status}**\n\n"
+        f"Ketika {status}:\n"
+        + ("• Bot akan otomatis beli token saat bot call mendeteksi token baru\n" if new_state else "• Bot TIDAK akan otomatis trading\n")
+        + f"• Max position: {TRADING_CONFIG['max_position_sol']} SOL\n"
+        + f"• TP: +{TRADING_CONFIG['take_profit_percent']}% | SL: -{TRADING_CONFIG['stop_loss_percent']}%",
+        ephemeral=True
+    )
+
+@trade_buy.error
+@trade_sell.error
+@trade_config_cmd.error
+@trade_toggle_auto.error
+async def trading_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("❌ Kamu tidak punya izin untuk menggunakan command ini. Hanya admin yang bisa trading.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
+
+# ============================================================================
+# --- HYPE TRADING SLASH COMMANDS ---
+# ============================================================================
+
+@bot.tree.command(name="dry_run", description="🧪 Toggle DRY RUN mode ON/OFF (test tanpa uang asli)")
+@app_commands.check(_trading_admin_check)
+async def dry_run_toggle(interaction: discord.Interaction):
+    """Toggle dry run (simulation) mode on/off."""
+    current = TRADING_CONFIG.get("dry_run", True)
+    TRADING_CONFIG["dry_run"] = not current
+    new_state = TRADING_CONFIG["dry_run"]
+    
+    if new_state:
+        emoji = "🧪"
+        status = "ON"
+        desc = (
+            "**DRY RUN MODE AKTIF** - Trading TIDAK akan menggunakan uang asli!\n\n"
+            "✅ Bot akan scan token seperti biasa\n"
+            "✅ Bot akan kirim notifikasi detection\n"
+            "❌ Bot TIDAK akan execute trade\n"
+            "❌ TIDAK ada SOL yang dipakai\n\n"
+            "Gunakan mode ini untuk testing sebelum trade beneran."
+        )
+    else:
+        emoji = "💰"
+        status = "OFF"
+        desc = (
+            "**⚠️ DRY RUN MODE NONAKTIF** - Trading akan menggunakan uang asli!\n\n"
+            "⚠️ Bot AKAN execute trade beneran\n"
+            "⚠️ SOL AKAN dipakai untuk trading\n"
+            "⚠️ Pastikan kamu sudah siap!\n\n"
+            f"Max per trade: {TRADING_CONFIG.get('max_position_sol', 0.5)} SOL\n"
+            f"TP: +{TRADING_CONFIG.get('take_profit_percent', 7)}% | SL: -{TRADING_CONFIG.get('stop_loss_percent', 5)}%"
+        )
+    
+    await interaction.response.send_message(
+        f"{emoji} DRY RUN mode sekarang **{status}**\n\n{desc}",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="hype_toggle", description="🔥 Toggle hype trading ON/OFF")
+@app_commands.check(_trading_admin_check)
+async def hype_toggle(interaction: discord.Interaction):
+    """Toggle hype trading on/off."""
+    if not TRADING_ENABLED:
+        await interaction.response.send_message("❌ Trading bot DISABLED. Enable TRADING_ENABLED first.", ephemeral=True)
+        return
+    
+    current = TRADING_CONFIG.get("hype_trading_enabled", False)
+    TRADING_CONFIG["hype_trading_enabled"] = not current
+    new_state = TRADING_CONFIG["hype_trading_enabled"]
+    
+    # Start/stop the scanner task
+    if new_state:
+        if not scan_hype_tokens.is_running():
+            scan_hype_tokens.start()
+    else:
+        if scan_hype_tokens.is_running():
+            scan_hype_tokens.stop()
+    
+    emoji = "✅" if new_state else "❌"
+    status = "ON" if new_state else "OFF"
+    dry_run_status = "🧪 DRY RUN" if TRADING_CONFIG.get("dry_run", True) else "💰 REAL"
+    
+    await interaction.response.send_message(
+        f"🔥 Hype Trading sekarang **{status}** {emoji}\n"
+        f"Mode: **{dry_run_status}**\n\n"
+        f"**Kriteria Hype Token:**\n"
+        f"• Volume 5min: ≥ ${TRADING_CONFIG.get('min_volume_5m_usd', 50000):,.0f}\n"
+        f"• Transaksi 5min: ≥ {TRADING_CONFIG.get('min_txns_5m', 50)}\n"
+        f"• Buyers 5min: ≥ {TRADING_CONFIG.get('min_buyers_5m', 30)}\n"
+        f"• Price Change 5min: {TRADING_CONFIG.get('min_price_change_5m', 5)}% - {TRADING_CONFIG.get('max_price_change_5m', 50)}%\n"
+        f"• Market Cap: ${TRADING_CONFIG.get('hype_min_mcap', 100000):,.0f} - ${TRADING_CONFIG.get('hype_max_mcap', 5000000):,.0f}",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="hype_scan", description="🔍 Manual scan untuk hype tokens sekarang")
+@app_commands.check(_trading_admin_check)
+async def hype_scan_cmd(interaction: discord.Interaction):
+    """Manually trigger a hype token scan."""
+    if not TRADING_ENABLED:
+        await interaction.response.send_message("❌ Trading bot DISABLED.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        qualifying_tokens = await scan_for_hype_tokens()
+        
+        if not qualifying_tokens:
+            await interaction.followup.send("❌ Tidak ada token yang memenuhi kriteria hype saat ini.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="🔥 Hype Tokens Detected",
+            description=f"Ditemukan **{len(qualifying_tokens)}** token dengan hype signals!",
+            color=0xff6b00,
+            timestamp=datetime.utcnow()
+        )
+        
+        for i, token in enumerate(qualifying_tokens[:5], 1):
+            symbol = token.get("symbol", "???")
+            name = token.get("name", "Unknown")
+            score = token.get("hype_score", 0)
+            vol_5m = token.get("volume_5m", 0)
+            txns_5m = token.get("txns_5m", 0)
+            buys_5m = token.get("buys_5m", 0)
+            price_5m = token.get("price_change_5m", 0)
+            mcap = token.get("market_cap", 0)
+            address = token.get("address", "")
+            
+            # Social indicators
+            social_icons = []
+            if token.get("has_twitter"):
+                social_icons.append("🐦")
+            if token.get("has_telegram"):
+                social_icons.append("📱")
+            if token.get("has_website"):
+                social_icons.append("🌐")
+            social_str = " ".join(social_icons) if social_icons else "❌"
+            
+            embed.add_field(
+                name=f"{i}. {symbol} (Score: {score}/100) {social_str}",
+                value=(
+                    f"**{name}**\n"
+                    f"📊 Vol 5m: **${vol_5m:,.0f}** | Txns: {txns_5m} ({buys_5m} buys)\n"
+                    f"📈 Price 5m: **{price_5m:+.1f}%** | MCap: ${mcap:,.0f}\n"
+                    f"[DexScreener](https://dexscreener.com/solana/{address}) | "
+                    f"[Jupiter](https://jup.ag/swap/SOL-{address}) | "
+                    f"[GMGN](https://gmgn.ai/sol/token/{address})"
+                ),
+                inline=False
+            )
+        
+        # Add dry run status footer
+        dry_run_status = "🧪 DRY RUN MODE (tidak trade beneran)" if TRADING_CONFIG.get("dry_run", True) else "💰 REAL MODE (akan trade beneran!)"
+        embed.set_footer(text=f"Mode: {dry_run_status}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="hype_config", description="⚙️ Lihat/ubah konfigurasi hype trading")
+@app_commands.describe(
+    min_volume_5m="Min volume dalam 5 menit (USD)",
+    min_txns_5m="Min transaksi dalam 5 menit",
+    min_price_5m="Min price change % dalam 5 menit",
+    max_price_5m="Max price change % dalam 5 menit",
+    min_mcap="Min market cap (USD)",
+    max_mcap="Max market cap (USD)"
+)
+@app_commands.check(_trading_admin_check)
+async def hype_config_cmd(
+    interaction: discord.Interaction,
+    min_volume_5m: Optional[float] = None,
+    min_txns_5m: Optional[int] = None,
+    min_price_5m: Optional[float] = None,
+    max_price_5m: Optional[float] = None,
+    min_mcap: Optional[float] = None,
+    max_mcap: Optional[float] = None
+):
+    """View or update hype trading configuration."""
+    if not TRADING_ENABLED:
+        await interaction.response.send_message("❌ Trading bot DISABLED.", ephemeral=True)
+        return
+    
+    # Update config if parameters provided
+    updated = []
+    if min_volume_5m is not None:
+        TRADING_CONFIG["min_volume_5m_usd"] = min_volume_5m
+        updated.append(f"Min Vol 5m: ${min_volume_5m:,.0f}")
+    
+    if min_txns_5m is not None:
+        TRADING_CONFIG["min_txns_5m"] = min_txns_5m
+        updated.append(f"Min Txns 5m: {min_txns_5m}")
+    
+    if min_price_5m is not None:
+        TRADING_CONFIG["min_price_change_5m"] = min_price_5m
+        updated.append(f"Min Price 5m: {min_price_5m}%")
+    
+    if max_price_5m is not None:
+        TRADING_CONFIG["max_price_change_5m"] = max_price_5m
+        updated.append(f"Max Price 5m: {max_price_5m}%")
+    
+    if min_mcap is not None:
+        TRADING_CONFIG["hype_min_mcap"] = min_mcap
+        updated.append(f"Min MCap: ${min_mcap:,.0f}")
+    
+    if max_mcap is not None:
+        TRADING_CONFIG["hype_max_mcap"] = max_mcap
+        updated.append(f"Max MCap: ${max_mcap:,.0f}")
+    
+    embed = discord.Embed(
+        title="🔥 Hype Trading Configuration",
+        color=0xff6b00,
+        timestamp=datetime.utcnow()
+    )
+    
+    # Status
+    hype_status = "✅ ON" if TRADING_CONFIG.get("hype_trading_enabled") else "❌ OFF"
+    embed.add_field(name="Status", value=hype_status, inline=True)
+    embed.add_field(name="Scan Interval", value=f"{TRADING_CONFIG.get('hype_scan_interval_sec', 60)}s", inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    
+    # Volume & Activity Filters
+    embed.add_field(name="Min Volume (5m)", value=f"${TRADING_CONFIG.get('min_volume_5m_usd', 50000):,.0f}", inline=True)
+    embed.add_field(name="Min Txns (5m)", value=f"{TRADING_CONFIG.get('min_txns_5m', 50)}", inline=True)
+    embed.add_field(name="Min Buyers (5m)", value=f"{TRADING_CONFIG.get('min_buyers_5m', 30)}", inline=True)
+    
+    # Price Filters
+    embed.add_field(name="Min Price Δ (5m)", value=f"{TRADING_CONFIG.get('min_price_change_5m', 5)}%", inline=True)
+    embed.add_field(name="Max Price Δ (5m)", value=f"{TRADING_CONFIG.get('max_price_change_5m', 50)}%", inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    
+    # Market Cap Filters
+    embed.add_field(name="Min Market Cap", value=f"${TRADING_CONFIG.get('hype_min_mcap', 100000):,.0f}", inline=True)
+    embed.add_field(name="Max Market Cap", value=f"${TRADING_CONFIG.get('hype_max_mcap', 5000000):,.0f}", inline=True)
+    embed.add_field(name="Min Liquidity", value=f"${TRADING_CONFIG.get('min_liquidity_usd', 5000):,.0f}", inline=True)
+    
+    # Token Age Filters
+    embed.add_field(name="Max Token Age", value=f"{TRADING_CONFIG.get('max_token_age_hours', 72)}h", inline=True)
+    embed.add_field(name="Min Token Age", value=f"{TRADING_CONFIG.get('min_token_age_minutes', 5)}min", inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    
+    if updated:
+        embed.description = f"✅ **Updated:** {', '.join(updated)}"
+    
+    embed.set_footer(text=f"Use /hype_toggle to enable/disable hype trading")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="kol_add", description="➕ Tambah KOL wallet untuk tracking")
+@app_commands.describe(
+    wallet="Solana wallet address KOL",
+    name="Nama KOL (contoh: 'ansem', 'blknoiz06')",
+    weight="Weight/importance 1-5 (default: 3)"
+)
+@app_commands.check(_trading_admin_check)
+async def kol_add(interaction: discord.Interaction, wallet: str, name: str, weight: int = 3):
+    """Add a KOL wallet for tracking."""
+    if not is_valid_solana_address(wallet):
+        await interaction.response.send_message("❌ Invalid Solana wallet address!", ephemeral=True)
+        return
+    
+    # Check if already exists
+    existing = [k for k in KOL_WALLETS if k.get("wallet") == wallet]
+    if existing:
+        await interaction.response.send_message(f"⚠️ Wallet sudah ada: {existing[0].get('name')}", ephemeral=True)
+        return
+    
+    weight = max(1, min(5, weight))  # Clamp 1-5
+    
+    KOL_WALLETS.append({
+        "wallet": wallet,
+        "name": name,
+        "weight": weight
+    })
+    save_kol_wallets()
+    
+    await interaction.response.send_message(
+        f"✅ KOL wallet ditambahkan!\n\n"
+        f"**Name:** {name}\n"
+        f"**Wallet:** `{wallet[:12]}...`\n"
+        f"**Weight:** {'⭐' * weight}\n\n"
+        f"Total KOL wallets: {len(KOL_WALLETS)}",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="kol_list", description="📋 Lihat daftar KOL wallets")
+async def kol_list(interaction: discord.Interaction):
+    """List all tracked KOL wallets."""
+    if not KOL_WALLETS:
+        await interaction.response.send_message(
+            "📭 Belum ada KOL wallet yang di-track.\n"
+            "Gunakan `/kol_add` untuk menambahkan.",
+            ephemeral=True
+        )
+        return
+    
+    embed = discord.Embed(
+        title="👑 KOL Wallets",
+        description=f"Total: **{len(KOL_WALLETS)}** KOL wallet(s)",
+        color=0xffd700,
+        timestamp=datetime.utcnow()
+    )
+    
+    for kol in KOL_WALLETS[:15]:  # Max 15
+        wallet = kol.get("wallet", "")
+        name = kol.get("name", "Unknown")
+        weight = kol.get("weight", 3)
+        
+        embed.add_field(
+            name=f"{'⭐' * weight} {name}",
+            value=f"`{wallet[:12]}...`\n[GMGN](https://gmgn.ai/sol/address/{wallet})",
+            inline=True
+        )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="kol_remove", description="➖ Hapus KOL wallet dari tracking")
+@app_commands.describe(wallet="Solana wallet address KOL yang mau dihapus")
+@app_commands.check(_trading_admin_check)
+async def kol_remove(interaction: discord.Interaction, wallet: str):
+    """Remove a KOL wallet from tracking."""
+    global KOL_WALLETS
+    
+    original_count = len(KOL_WALLETS)
+    KOL_WALLETS = [k for k in KOL_WALLETS if k.get("wallet") != wallet]
+    
+    if len(KOL_WALLETS) == original_count:
+        await interaction.response.send_message("❌ Wallet tidak ditemukan!", ephemeral=True)
+        return
+    
+    save_kol_wallets()
+    
+    await interaction.response.send_message(
+        f"✅ KOL wallet dihapus!\n"
+        f"**Wallet:** `{wallet[:12]}...`\n"
+        f"Remaining: {len(KOL_WALLETS)} wallet(s)",
+        ephemeral=True
+    )
+
+@dry_run_toggle.error
+@hype_toggle.error
+@hype_scan_cmd.error
+@hype_config_cmd.error
+@kol_add.error
+@kol_remove.error
+async def hype_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("❌ Kamu tidak punya izin untuk menggunakan command ini.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
 
 @bot.tree.command(name="metadao_test", description="Kirim notifikasi MetaDAO test ke channel damm")
 @app_commands.describe(
