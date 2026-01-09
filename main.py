@@ -3755,7 +3755,7 @@ async def on_member_join(member: discord.Member):
                 await channel.send(
                     f"👋 Selamat datang {member.mention}!\n\n"
                     "Welcome Lpeeps👋 Selamat datang di metina.id komunitas Liquidity Provider di Indonesia 🇮🇩. "
-                    f"Biar lebih afdol baca {rules_channel_mention} & #👋｜welcome. Lets grow together 🚀\n\n"
+                    f"Biar lebih afdol baca {rules_channel_mention}. Lets grow together 🚀\n\n"
                     f"⚠️ **Penting:** Silakan verifikasi diri kamu di {verify_channel_mention} untuk mendapatkan akses penuh ke server! ✅\n\n"
                     f"💡 **Fitur Tambahan:** Cek {feature_channel_mention} untuk aktifkan fitur seperti Track Wallet! 💼"
                 )
