@@ -1,0 +1,23 @@
+# Nixpacks configuration for Railway
+# This ensures both Python and Node.js are available
+# Note: npm is included with nodejs-18_x, no need to specify separately
+# Using virtual environment to avoid externally-managed-environment error
+# python3Full includes pip and venv module
+
+[phases.setup]
+nixPkgs = ["python3Full", "nodejs-18_x"]
+
+[phases.install]
+cmds = [
+    "python3 -m venv /app/venv",
+    ". /app/venv/bin/activate && pip install --upgrade pip",
+    ". /app/venv/bin/activate && pip install -r requirements.txt",
+    "npm install"
+]
+
+[phases.build]
+cmds = []
+
+[start]
+cmd = ". /app/venv/bin/activate && python main.py"
+

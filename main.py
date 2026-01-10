@@ -11,8 +11,9 @@ import time
 import random
 from collections import deque
 from discord import app_commands
+from discord.ui import Button, View
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # --- TOKEN ---
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
@@ -827,7 +828,7 @@ async def send_trading_notification(title: str, description: str, color: int, po
         title=title,
         description=description,
         color=color,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc)
     )
     
     if position:
@@ -1327,7 +1328,7 @@ async def send_hype_notification(hype_data: Dict, trade_result: str = None, is_d
         title=title,
         description=desc,
         color=color,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc)
     )
     
     # Volume & Activity
@@ -1952,7 +1953,7 @@ async def _send_metadao_embed(channel: discord.TextChannel, launch: Dict[str, ob
         title=title,
         description="\n\n".join(desc_parts),
         color=0xFF7B7B if reminder else 0x3498db,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc)
     )
     embed.add_field(name="Project", value=f"**{launch.get('name')}**", inline=True)
     if launch.get("token_symbol"):
@@ -2464,7 +2465,7 @@ async def send_bot_call_notification(token_data: Dict[str, object]):
             title=f"🆕 New Token Detected: {token_symbol}",
             description=f"**{token_name}** (`{token_symbol}`)\n\nToken baru terdeteksi dengan kriteria:\n• Market Cap: {market_cap_str}\n• Total Fees (24h): {fees_sol_str} ({fees_usd_str})",
             color=0x00ff00,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         
         embed.add_field(name="Market Cap", value=market_cap_str, inline=True)
@@ -4184,7 +4185,7 @@ async def send_launch_notification(token_address: str, token_data: Dict, pools: 
                 f"🪐 **Jupiter:** {jupiter_status}"
             ),
             color=0x00FF00,  # Green
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         
         embed.add_field(name="💰 Liquidity", value=liquidity_str, inline=True)
@@ -4310,7 +4311,7 @@ async def poll_token_launches():
                     launch_detected_pools[token_address] = pool_address
                     launch_tracker_tokens[token_address]["status"] = "launched"
                     launch_tracker_tokens[token_address]["pool_address"] = pool_address
-                    launch_tracker_tokens[token_address]["launched_at"] = datetime.utcnow().isoformat()
+                    launch_tracker_tokens[token_address]["launched_at"] = datetime.now(timezone.utc).isoformat()
                     launch_tracker_tokens[token_address]["jupiter_tradeable"] = True
                     save_launch_tracker_state()
                     
@@ -4346,9 +4347,10 @@ async def before_poll_launches():
 # --- ICO TRACKER BACKGROUND TASK ---
 # ============================================================================
 
-async def send_ico_notification(ico_data: Dict, notification_type: str = "daily"):
+async def send_ico_notification(ico_data: Dict, notification_type: str = "daily", ico_id: str = None):
     """Send ICO notification to channel.
     notification_type: 'daily', 'hour_warning', 'ended'
+    ico_id: Optional ICO ID for refresh button functionality
     """
     channel_id = ICO_TRACKER_CHANNEL_ID or DAMM_CHANNEL_ID or BOT_CALL_CHANNEL_ID
     if not channel_id:
@@ -4373,9 +4375,13 @@ async def send_ico_notification(ico_data: Dict, notification_type: str = "daily"
         time_remaining_str = "N/A"
         if end_time_str:
             try:
+                # Parse end_time and ensure it's treated as UTC
                 end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
-                now = datetime.now(end_time.tzinfo) if end_time.tzinfo else datetime.utcnow()
-                diff = end_time - now.replace(tzinfo=None) if not end_time.tzinfo else end_time - now
+                if end_time.tzinfo is None:
+                    # If no timezone info, assume it's UTC
+                    end_time = end_time.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                diff = end_time - now
                 
                 total_seconds = int(diff.total_seconds())
                 if total_seconds > 0:
@@ -4423,7 +4429,7 @@ async def send_ico_notification(ico_data: Dict, notification_type: str = "daily"
             title=title,
             description=description,
             color=color,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         
         embed.add_field(name="💰 Committed", value=committed_str, inline=True)
@@ -4446,12 +4452,147 @@ async def send_ico_notification(ico_data: Dict, notification_type: str = "daily"
         
         embed.set_footer(text=f"ICO Tracker | {ico_name}")
         
+        # Create refresh button view if ICO is still ongoing
+        view = None
+        if notification_type != "ended" and ico_id:
+            class RefreshICOView(discord.ui.View):
+                def __init__(self, ico_id: str):
+                    super().__init__(timeout=None)
+                    self.ico_id = ico_id
+                
+                @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary)
+                async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+                    await interaction.response.defer()
+                    
+                    try:
+                        # Access global ico_tracker_list
+                        global ico_tracker_list
+                        
+                        # Get latest ICO data
+                        if self.ico_id not in ico_tracker_list:
+                            await interaction.followup.send("❌ ICO tidak ditemukan lagi di tracker!", ephemeral=True)
+                            return
+                        
+                        latest_ico_data = ico_tracker_list[self.ico_id]
+                        
+                        # Recalculate time remaining
+                        end_time_str = latest_ico_data.get("end_time", "")
+                        time_remaining_str = "N/A"
+                        total_seconds = 0
+                        is_ended = False
+                        
+                        if end_time_str:
+                            try:
+                                # Parse end_time and ensure it's treated as UTC
+                                end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+                                if end_time.tzinfo is None:
+                                    # If no timezone info, assume it's UTC
+                                    end_time = end_time.replace(tzinfo=timezone.utc)
+                                now = datetime.now(timezone.utc)
+                                diff = end_time - now
+                                
+                                total_seconds = int(diff.total_seconds())
+                                if total_seconds > 0:
+                                    days = total_seconds // 86400
+                                    hours = (total_seconds % 86400) // 3600
+                                    minutes = (total_seconds % 3600) // 60
+                                    
+                                    if days > 0:
+                                        time_remaining_str = f"{days}D {hours}H {minutes}M"
+                                    elif hours > 0:
+                                        time_remaining_str = f"{hours}H {minutes}M"
+                                    else:
+                                        time_remaining_str = f"{minutes} menit"
+                                else:
+                                    time_remaining_str = "ENDED"
+                                    is_ended = True
+                            except:
+                                pass
+                        
+                        # Get updated values
+                        latest_name = latest_ico_data.get("name", "Unknown")
+                        latest_symbol = latest_ico_data.get("token_symbol", "???")
+                        latest_target = latest_ico_data.get("target", 0)
+                        latest_committed = latest_ico_data.get("committed", 0)
+                        latest_url = latest_ico_data.get("url", "")
+                        latest_token_address = latest_ico_data.get("token_address", "")
+                        
+                        # Format updated values
+                        target_str = f"${latest_target:,.0f}" if latest_target else "N/A"
+                        committed_str = f"${latest_committed:,.0f}" if latest_committed else "N/A"
+                        progress_pct = (latest_committed / latest_target * 100) if latest_target and latest_committed else 0
+                        
+                        # Update embed based on status
+                        if is_ended or time_remaining_str == "ENDED":
+                            new_title = f"🏁 ICO ENDED: {latest_symbol}"
+                            new_description = f"**{latest_name}** ICO sudah berakhir!"
+                            new_color = 0x888888  # Gray
+                        elif total_seconds > 0 and total_seconds <= 3600:  # Less than 1 hour
+                            new_title = f"⏰ ICO ENDING SOON! {latest_symbol}"
+                            new_description = (
+                                f"**{latest_name}** ICO akan berakhir dalam **{time_remaining_str}**!\n\n"
+                                f"🚨 **LAST CHANCE TO PARTICIPATE!**"
+                            )
+                            new_color = 0xFF6600  # Orange
+                        else:
+                            new_title = f"📊 ICO Update: {latest_symbol}"
+                            new_description = (
+                                f"**{latest_name}** ICO masih berlangsung!\n\n"
+                                f"⏱️ Sisa waktu: **{time_remaining_str}**"
+                            )
+                            new_color = 0x00AAFF  # Blue
+                        
+                        # Create updated embed
+                        updated_embed = discord.Embed(
+                            title=new_title,
+                            description=new_description,
+                            color=new_color,
+                            timestamp=datetime.now(timezone.utc)
+                        )
+                        
+                        updated_embed.add_field(name="💰 Committed", value=committed_str, inline=True)
+                        updated_embed.add_field(name="🎯 Target", value=target_str, inline=True)
+                        updated_embed.add_field(name="📈 Progress", value=f"{progress_pct:.1f}%", inline=True)
+                        updated_embed.add_field(name="⏱️ Time Left", value=time_remaining_str, inline=True)
+                        
+                        # Links
+                        links = []
+                        if latest_url:
+                            links.append(f"[🍎 MetaDAO ICO]({latest_url})")
+                        if latest_token_address:
+                            links.extend([
+                                f"[🔍 Solscan](https://solscan.io/token/{latest_token_address})",
+                                f"[📊 GMGN](https://gmgn.ai/sol/token/{latest_token_address})"
+                            ])
+                        
+                        if links:
+                            updated_embed.add_field(name="🔗 Links", value="\n".join(links), inline=False)
+                        
+                        updated_embed.set_footer(text=f"ICO Tracker | {latest_name} | Updated")
+                        
+                        # Update view - remove button if ended
+                        if is_ended or time_remaining_str == "ENDED":
+                            new_view = None
+                        else:
+                            new_view = self
+                        
+                        await interaction.message.edit(embed=updated_embed, view=new_view)
+                        await interaction.followup.send("✅ ICO info diperbarui!", ephemeral=True)
+                        
+                    except Exception as e:
+                        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+                        print(f"[ICO_TRACKER] Error refreshing ICO: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            view = RefreshICOView(ico_id)
+        
         # Mention role for hour warning
         mention_text = ""
         if notification_type == "hour_warning" and MENTION_ROLE_ID:
             mention_text = f"<@&{MENTION_ROLE_ID}> "
         
-        await channel.send(content=f"{mention_text}", embed=embed)
+        await channel.send(content=f"{mention_text}", embed=embed, view=view)
         print(f"[ICO_TRACKER] Sent {notification_type} notification for {ico_name}")
         
     except Exception as e:
@@ -4471,9 +4612,9 @@ async def poll_ico_tracker():
         return
     
     print(f"[ICO_TRACKER] Checking {len(ico_tracker_list)} tracked ICO(s)...")
-    now = datetime.utcnow()
-    today_str = now.strftime("%Y-%m-%d")
-    print(f"[ICO_TRACKER] Current UTC time: {now.isoformat()}")
+    now_utc = datetime.now(timezone.utc)
+    today_str = now_utc.strftime("%Y-%m-%d")
+    print(f"[ICO_TRACKER] Current UTC time: {now_utc.isoformat()}")
     
     for ico_id, ico_data in list(ico_tracker_list.items()):
         try:
@@ -4484,13 +4625,15 @@ async def poll_ico_tracker():
             # Parse end time
             try:
                 end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
-                end_time_naive = end_time.replace(tzinfo=None) if end_time.tzinfo else end_time
+                if end_time.tzinfo is None:
+                    # If no timezone info, assume it's UTC
+                    end_time = end_time.replace(tzinfo=timezone.utc)
             except:
                 print(f"[ICO_TRACKER] Invalid end_time for {ico_id}")
                 continue
             
             # Calculate time remaining
-            diff = end_time_naive - now
+            diff = end_time - now_utc
             total_seconds = int(diff.total_seconds())
             
             # Debug log
@@ -4502,7 +4645,7 @@ async def poll_ico_tracker():
             if total_seconds <= 0:
                 # Send ended notification if not sent
                 if not ico_data.get("ended_notified"):
-                    await send_ico_notification(ico_data, "ended")
+                    await send_ico_notification(ico_data, "ended", ico_id)
                     ico_tracker_list[ico_id]["ended_notified"] = True
                     save_ico_tracker_state()
                 continue
@@ -4511,7 +4654,7 @@ async def poll_ico_tracker():
             if 1800 <= total_seconds <= 5400:  # 30-90 minutes
                 if not ico_data.get("hour_reminder_sent"):
                     print(f"[ICO_TRACKER] 🚨 Sending 1-hour warning for {ico_data.get('name')}")
-                    await send_ico_notification(ico_data, "hour_warning")
+                    await send_ico_notification(ico_data, "hour_warning", ico_id)
                     ico_tracker_list[ico_id]["hour_reminder_sent"] = True
                     save_ico_tracker_state()
             
@@ -4519,7 +4662,7 @@ async def poll_ico_tracker():
             daily_notified = ico_data.get("daily_notified_dates", [])
             if today_str not in daily_notified:
                 print(f"[ICO_TRACKER] 📊 Sending daily update for {ico_data.get('name')}")
-                await send_ico_notification(ico_data, "daily")
+                await send_ico_notification(ico_data, "daily", ico_id)
                 
                 # Update notified dates
                 if "daily_notified_dates" not in ico_tracker_list[ico_id]:
@@ -4638,6 +4781,12 @@ def _trading_admin_check(interaction: discord.Interaction) -> bool:
         return True
     raise app_commands.CheckFailure("Kamu butuh izin Admin untuk menggunakan trading commands.")
 
+def _lp_admin_check(interaction: discord.Interaction) -> bool:
+    """Check if user can use LP agent commands (admin/moderator only)."""
+    if _user_can_run_admin_actions(interaction.user):
+        return True
+    raise app_commands.CheckFailure("❌ Kamu tidak punya izin untuk menggunakan LP Agent commands. Hanya Admin yang bisa menggunakan fitur ini.")
+
 @bot.tree.command(name="trade_buy", description="🛒 Beli token dengan SOL (ADMIN ONLY)")
 @app_commands.describe(
     token_address="Solana token address untuk dibeli",
@@ -4685,7 +4834,7 @@ async def trade_buy(
                 title=f"🛒 Position Opened: {symbol}",
                 description=f"Berhasil beli **{symbol}** dengan **{amount_sol:.4f} SOL**",
                 color=0x00ff00,
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(timezone.utc)
             )
             embed.add_field(name="Token", value=f"**{token_name}**\n`{token_address[:12]}...`", inline=True)
             embed.add_field(name="Amount", value=f"{amount_sol:.4f} SOL", inline=True)
@@ -4745,7 +4894,7 @@ async def trade_sell(interaction: discord.Interaction, token_address: str):
                 title=f"💰 Position Closed: {symbol}",
                 description=f"Berhasil jual **{symbol}**",
                 color=0x00ff00 if pnl and pnl >= 0 else 0xff0000,
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(timezone.utc)
             )
             embed.add_field(name="P&L", value=f"{pnl_emoji} {pnl_str}\n({pnl_percent:+.2f}%)", inline=True)
             embed.add_field(name="Entry", value=f"{position['entry_amount_sol']:.4f} SOL", inline=True)
@@ -4779,7 +4928,7 @@ async def trade_positions(interaction: discord.Interaction):
             title="📊 Active Trading Positions",
             description=f"Total: **{len(active_positions)}** posisi aktif",
             color=0x3498db,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         
         for token_address, position in active_positions.items():
@@ -4848,7 +4997,7 @@ async def trade_history_cmd(interaction: discord.Interaction, limit: int = 10):
                 f"**Total P&L:** {total_pnl:+.4f} SOL"
             ),
             color=0x00ff00 if total_pnl >= 0 else 0xff0000,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         
         for trade in recent_trades[:5]:  # Show max 5 in embed
@@ -4915,7 +5064,7 @@ async def trade_config_cmd(
     embed = discord.Embed(
         title="⚙️ Trading Configuration",
         color=0x9b59b6,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc)
     )
     
     embed.add_field(name="Take Profit", value=f"+{TRADING_CONFIG['take_profit_percent']}%", inline=True)
@@ -5068,7 +5217,7 @@ async def hype_scan_cmd(interaction: discord.Interaction):
                     "**Kriteria saat ini:**"
                 ),
                 color=0xffaa00,  # Yellow
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(timezone.utc)
             )
             embed.add_field(name="Min Volume 5m", value=f"${TRADING_CONFIG.get('min_volume_5m_usd', 50000):,.0f}", inline=True)
             embed.add_field(name="Min Txns 5m", value=f"{TRADING_CONFIG.get('min_txns_5m', 50)}", inline=True)
@@ -5085,7 +5234,7 @@ async def hype_scan_cmd(interaction: discord.Interaction):
             title="🔥 Hype Tokens Detected",
             description=f"Ditemukan **{len(qualifying_tokens)}** token dengan hype signals!",
             color=0xff6b00,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         
         for i, token in enumerate(qualifying_tokens[:5], 1):
@@ -5192,7 +5341,7 @@ async def hype_test_cmd(interaction: discord.Interaction):
             title="🧪 Hype API Test Results",
             description="\n".join(results),
             color=0x00ff00 if all("✅" in r for r in results) else 0xffaa00,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         
         embed.add_field(
@@ -5266,7 +5415,7 @@ async def hype_config_cmd(
     embed = discord.Embed(
         title="🔥 Hype Trading Configuration",
         color=0xff6b00,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc)
     )
     
     # Status
@@ -5354,7 +5503,7 @@ async def kol_list(interaction: discord.Interaction):
         title="👑 KOL Wallets",
         description=f"Total: **{len(KOL_WALLETS)}** KOL wallet(s)",
         color=0xffd700,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc)
     )
     
     for kol in KOL_WALLETS[:15]:  # Max 15
@@ -5477,7 +5626,7 @@ async def launch_add(
     launch_tracker_tokens[token_address] = {
         "name": name or "Unknown",
         "symbol": symbol or "???",
-        "added_at": datetime.utcnow().isoformat(),
+        "added_at": datetime.now(timezone.utc).isoformat(),
         "added_by": str(interaction.user),
         "status": "tracking",
         "existing_pools": existing_pool_addresses  # Save existing pools to skip later
@@ -5535,7 +5684,7 @@ async def launch_list(interaction: discord.Interaction):
         title="🚀 Launch Tracker",
         description=f"**{len(launch_tracker_tokens)}** token sedang di-track",
         color=0x00ff88,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc)
     )
     
     for address, data in list(launch_tracker_tokens.items())[:10]:
@@ -5596,7 +5745,7 @@ async def launch_check(interaction: discord.Interaction, token_address: str):
             title="🎉 Pool Ditemukan!",
             description=f"**{len(pools)}** pool tersedia untuk token ini",
             color=0x00ff00,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         
         for i, pool in enumerate(pools[:5], 1):
@@ -5751,9 +5900,9 @@ async def ico_add(
     # Generate ICO ID
     ico_id = f"{token_symbol.upper()}-{int(time.time())}"
     
-    # Calculate end time
+    # Calculate end time (using UTC)
     total_seconds = (days_remaining * 86400) + (hours_remaining * 3600)
-    end_time = datetime.utcnow() + timedelta(seconds=total_seconds)
+    end_time = datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
     end_time_str = end_time.isoformat()
     
     # Create ICO entry
@@ -5765,7 +5914,7 @@ async def ico_add(
         "committed": committed or 0,
         "url": url or "",
         "token_address": token_address or "",
-        "added_at": datetime.utcnow().isoformat(),
+        "added_at": datetime.now(timezone.utc).isoformat(),
         "added_by": str(interaction.user),
         "daily_notified_dates": [],
         "hour_reminder_sent": False,
@@ -5831,10 +5980,10 @@ async def ico_list(interaction: discord.Interaction):
         title="🍎 ICO Tracker",
         description=f"**{len(ico_tracker_list)}** ICO sedang di-track",
         color=0xFF6B6B,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc)
     )
     
-    now = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     
     for ico_id, data in list(ico_tracker_list.items())[:10]:
         name = data.get("name", "Unknown")
@@ -5849,9 +5998,12 @@ async def ico_list(interaction: discord.Interaction):
         status_emoji = "🟢"
         if end_time_str:
             try:
+                # Parse end_time and ensure it's treated as UTC
                 end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
-                end_naive = end_time.replace(tzinfo=None) if end_time.tzinfo else end_time
-                diff = end_naive - now
+                if end_time.tzinfo is None:
+                    # If no timezone info, assume it's UTC
+                    end_time = end_time.replace(tzinfo=timezone.utc)
+                diff = end_time - now_utc
                 total_seconds = int(diff.total_seconds())
                 
                 if total_seconds <= 0:
@@ -5955,7 +6107,7 @@ async def ico_notify(
     await interaction.response.defer(ephemeral=True)
     
     try:
-        await send_ico_notification(ico_tracker_list[ico_id], notification_type)
+        await send_ico_notification(ico_tracker_list[ico_id], notification_type, ico_id)
         await interaction.followup.send(f"✅ Notifikasi `{notification_type}` dikirim!", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
@@ -6116,7 +6268,7 @@ async def metadao_fetch(interaction: discord.Interaction):
             title="🔍 MetaDAO Fetch Debug",
             description="\n".join(results),
             color=0x00ff00 if launches else 0xff6600,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         embed.set_footer(text=f"Poll interval: {METADAO_POLL_INTERVAL_MINUTES} minutes")
         
@@ -6584,6 +6736,663 @@ async def call_token(ctx: commands.Context, ca: str):
             import traceback
             traceback.print_exc()
             await ctx.send(f"❌ **Error**: {error_msg}")
+
+# ============================================================================
+# --- METEORA LP AGENT COMMANDS ---
+# ============================================================================
+
+# Import LP agent module
+try:
+    from meteora_lp_agent import get_lp_agent, MeteoraLPAgent
+    LP_AGENT_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] Meteora LP Agent not available: {e}")
+    LP_AGENT_AVAILABLE = False
+
+@bot.tree.command(name="lp_pool_info", description="🌊 Get informasi pool Meteora DLMM")
+@app_commands.describe(pool_address="Address pool Meteora DLMM")
+@app_commands.check(_lp_admin_check)
+async def lp_pool_info(interaction: discord.Interaction, pool_address: str):
+    """Get informasi pool Meteora DLMM"""
+    if not LP_AGENT_AVAILABLE:
+        await interaction.response.send_message("❌ LP Agent tidak tersedia. Install dependencies yang diperlukan.", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        agent = get_lp_agent()
+        if not agent:
+            await interaction.followup.send("❌ LP Agent tidak terinisialisasi. Set LP_WALLET_PRIVATE_KEY untuk enable.", ephemeral=True)
+            return
+        
+        pool_info = await agent.get_pool_info(pool_address)
+        
+        if not pool_info:
+            await interaction.followup.send(f"❌ Pool tidak ditemukan: `{pool_address}`", ephemeral=True)
+            return
+        
+        # Format embed
+        embed = discord.Embed(
+            title=f"🌊 Meteora DLMM Pool",
+            description=f"**{pool_info.get('name', 'Unknown Pool')}**",
+            color=0x00ff00
+        )
+        
+        embed.add_field(
+            name="📊 Pool Info",
+            value=(
+                f"**Address:** `{pool_info.get('address', 'N/A')[:8]}...`\n"
+                f"**Mint X:** `{pool_info.get('mint_x', 'N/A')[:8]}...`\n"
+                f"**Mint Y:** `{pool_info.get('mint_y', 'N/A')[:8]}...`\n"
+                f"**Bin Step:** {pool_info.get('bin_step', 'N/A')}\n"
+                f"**Base Fee:** {pool_info.get('base_fee_percentage', 0)}%"
+            ),
+            inline=False
+        )
+        
+        tvl = pool_info.get('tvl', 0)
+        liquidity = pool_info.get('liquidity', 0)
+        volume_24h = pool_info.get('volume_24h', 0)
+        fees_24h = pool_info.get('fees_24h', 0)
+        
+        embed.add_field(
+            name="💰 Metrics",
+            value=(
+                f"**TVL:** ${tvl:,.2f}\n"
+                f"**Liquidity:** ${liquidity:,.2f}\n"
+                f"**Volume 24h:** ${volume_24h:,.2f}\n"
+                f"**Fees 24h:** ${fees_24h:,.2f}"
+            ),
+            inline=False
+        )
+        
+        pool_link = f"https://app.meteora.ag/dlmm/{pool_info.get('address', '')}"
+        embed.add_field(
+            name="🔗 Links",
+            value=f"[View on Meteora]({pool_link})",
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"[LP_AGENT] Error in lp_pool_info: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="lp_positions", description="📊 Lihat semua LP positions wallet")
+@app_commands.describe(wallet_address="Wallet address (opsional, default: bot wallet)")
+@app_commands.check(_lp_admin_check)
+async def lp_positions(interaction: discord.Interaction, wallet_address: Optional[str] = None):
+    """Lihat semua LP positions"""
+    if not LP_AGENT_AVAILABLE:
+        await interaction.response.send_message("❌ LP Agent tidak tersedia.", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        agent = get_lp_agent()
+        if not agent:
+            await interaction.followup.send("❌ LP Agent tidak terinisialisasi.", ephemeral=True)
+            return
+        
+        positions = await agent.get_lp_positions(wallet_address)
+        
+        if not positions:
+            await interaction.followup.send(
+                f"📭 Tidak ada LP positions ditemukan untuk wallet: `{wallet_address or agent.wallet_address or 'N/A'}`",
+                ephemeral=True
+            )
+            return
+        
+        embed = discord.Embed(
+            title="📊 LP Positions",
+            description=f"Found **{len(positions)}** position(s)",
+            color=0x3498db
+        )
+        
+        for i, pos in enumerate(positions[:10], 1):  # Limit to 10 positions
+            pos_addr = pos.get('position_address', 'N/A')
+            embed.add_field(
+                name=f"Position #{i}",
+                value=f"`{pos_addr[:8]}...`" if len(pos_addr) > 8 else f"`{pos_addr}`",
+                inline=True
+            )
+        
+        if len(positions) > 10:
+            embed.set_footer(text=f"Showing 10 of {len(positions)} positions")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"[LP_AGENT] Error in lp_positions: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="lp_returns", description="📈 Calculate estimated LP returns")
+@app_commands.describe(
+    pool_address="Address pool Meteora DLMM",
+    token_x_amount="Amount token X (dalam SOL atau token units)",
+    token_y_amount="Amount token Y (dalam SOL atau token units)",
+    days="Number of days untuk projection (default: 7)"
+)
+@app_commands.check(_lp_admin_check)
+async def lp_returns(
+    interaction: discord.Interaction,
+    pool_address: str,
+    token_x_amount: float,
+    token_y_amount: float,
+    days: int = 7
+):
+    """Calculate estimated LP returns"""
+    if not LP_AGENT_AVAILABLE:
+        await interaction.response.send_message("❌ LP Agent tidak tersedia.", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        agent = get_lp_agent()
+        if not agent:
+            await interaction.followup.send("❌ LP Agent tidak terinisialisasi.", ephemeral=True)
+            return
+        
+        returns_data = await agent.calculate_lp_returns(
+            pool_address,
+            token_x_amount,
+            token_y_amount,
+            days
+        )
+        
+        if not returns_data:
+            await interaction.followup.send(f"❌ Tidak bisa calculate returns untuk pool: `{pool_address}`", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="📈 Estimated LP Returns",
+            description=f"Projection untuk **{days} hari**",
+            color=0x00ff00
+        )
+        
+        embed.add_field(
+            name="💰 Your Position",
+            value=(
+                f"**TVL:** ${returns_data.get('user_tvl', 0):,.2f}\n"
+                f"**Pool Share:** {returns_data.get('pool_share_pct', 0):.2f}%\n"
+                f"**Pool TVL:** ${returns_data.get('pool_tvl', 0):,.2f}"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📊 Returns Estimate",
+            value=(
+                f"**Daily Fees:** ${returns_data.get('daily_fees_estimate', 0):,.2f}\n"
+                f"**{days}D Returns:** ${returns_data.get('estimated_7d_returns', 0):,.2f}\n"
+                f"**Estimated APR:** {returns_data.get('estimated_apr', 0):.2f}%"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📈 Pool Metrics",
+            value=(
+                f"**Fees 24h:** ${returns_data.get('pool_fees_24h', 0):,.2f}"
+            ),
+            inline=False
+        )
+        
+        pool_link = f"https://app.meteora.ag/dlmm/{pool_address}"
+        embed.add_field(
+            name="🔗 Links",
+            value=f"[View Pool]({pool_link})",
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"[LP_AGENT] Error in lp_returns: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="lp_monitor", description="👁️ Monitor LP position status")
+@app_commands.describe(position_address="Address LP position")
+@app_commands.check(_lp_admin_check)
+async def lp_monitor(interaction: discord.Interaction, position_address: str):
+    """Monitor LP position"""
+    if not LP_AGENT_AVAILABLE:
+        await interaction.response.send_message("❌ LP Agent tidak tersedia.", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        agent = get_lp_agent()
+        if not agent:
+            await interaction.followup.send("❌ LP Agent tidak terinisialisasi.", ephemeral=True)
+            return
+        
+        position_data = await agent.monitor_position(position_address)
+        
+        if not position_data:
+            await interaction.followup.send(f"❌ Position tidak ditemukan: `{position_address}`", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="👁️ LP Position Status",
+            description=f"Position: `{position_address[:8]}...`",
+            color=0x3498db
+        )
+        
+        embed.add_field(
+            name="📊 Position Info",
+            value=(
+                f"**Address:** `{position_address[:16]}...`\n"
+                f"**Lamports:** {position_data.get('lamports', 0):,}\n"
+                f"**Owner:** `{position_data.get('owner', 'N/A')[:8]}...`"
+            ),
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"[LP_AGENT] Error in lp_monitor: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="lp_add", description="➕ Add liquidity ke Meteora DLMM pool")
+@app_commands.describe(
+    pool_address="Address pool Meteora DLMM",
+    token_x_amount="Amount token X (dalam token units)",
+    token_y_amount="Amount token Y (dalam token units)",
+    token_x_mint="Mint address untuk token X",
+    token_y_mint="Mint address untuk token Y",
+    strategy="Strategy type: spot, curve, atau bid_ask",
+    min_price="Minimum price untuk range (opsional)",
+    max_price="Maximum price untuk range (opsional)",
+    slippage_bps="Slippage tolerance in basis points (100 = 1%, default: 100)",
+    position_address="Existing position address (opsional, kosongkan untuk create new)"
+)
+@app_commands.check(_lp_admin_check)
+async def lp_add(
+    interaction: discord.Interaction,
+    pool_address: str,
+    token_x_amount: float,
+    token_y_amount: float,
+    token_x_mint: str,
+    token_y_mint: str,
+    strategy: str = "spot",
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    slippage_bps: int = 100,
+    position_address: Optional[str] = None
+):
+    """Add liquidity ke Meteora DLMM pool"""
+    if not LP_AGENT_AVAILABLE:
+        await interaction.response.send_message("❌ LP Agent tidak tersedia.", ephemeral=True)
+        return
+    
+    # Validate strategy
+    if strategy.lower() not in ["spot", "curve", "bid_ask"]:
+        await interaction.response.send_message(
+            "❌ Invalid strategy. Pilih: spot, curve, atau bid_ask",
+            ephemeral=True
+        )
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        agent = get_lp_agent()
+        if not agent or not agent.keypair:
+            await interaction.followup.send(
+                "❌ LP Agent tidak terinisialisasi. Set LP_WALLET_PRIVATE_KEY environment variable.",
+                ephemeral=True
+            )
+            return
+        
+        # Validate addresses
+        if not is_valid_solana_address(pool_address):
+            await interaction.followup.send("❌ Invalid pool address!", ephemeral=True)
+            return
+        
+        if not is_valid_solana_address(token_x_mint):
+            await interaction.followup.send("❌ Invalid token X mint address!", ephemeral=True)
+            return
+        
+        if not is_valid_solana_address(token_y_mint):
+            await interaction.followup.send("❌ Invalid token Y mint address!", ephemeral=True)
+            return
+        
+        # Validate price range
+        if min_price and max_price and min_price >= max_price:
+            await interaction.followup.send("❌ Min price harus lebih kecil dari max price!", ephemeral=True)
+            return
+        
+        # Get preview dengan fee breakdown
+        preview = await agent.preview_add_liquidity(
+            pool_address=pool_address,
+            token_x_amount=token_x_amount,
+            token_y_amount=token_y_amount,
+            token_x_mint=token_x_mint,
+            token_y_mint=token_y_mint,
+            strategy_type=strategy.lower(),
+            min_price=min_price,
+            max_price=max_price,
+            position_address=position_address
+        )
+        
+        if not preview:
+            await interaction.followup.send("❌ Gagal mendapatkan preview. Pool mungkin tidak ditemukan.", ephemeral=True)
+            return
+        
+        # Show fee preview dengan refundable/non-refundable info
+        fees = preview.get('fees', {})
+        refundable_fee = fees.get('refundable_fee_sol', 0)
+        non_refundable_fee = fees.get('non_refundable_fee_sol', 0)
+        total_fee = fees.get('total_fee_sol', 0)
+        
+        preview_embed = discord.Embed(
+            title="💰 Add Liquidity Preview",
+            description=f"**Pool:** {preview.get('pool_name', 'Unknown')}\n`{pool_address[:8]}...`",
+            color=0x3498db
+        )
+        
+        preview_embed.add_field(
+            name="📊 Position Details",
+            value=(
+                f"**Token X:** {token_x_amount} (`{token_x_mint[:8]}...`)\n"
+                f"**Token Y:** {token_y_amount} (`{token_y_mint[:8]}...`)\n"
+                f"**Strategy:** {strategy.upper()}\n"
+                f"**Bins:** {fees.get('num_bins', 0)} ({preview.get('min_bin_id', 0)} - {preview.get('max_bin_id', 0)})"
+            ),
+            inline=False
+        )
+        
+        if min_price and max_price:
+            preview_embed.add_field(
+                name="💰 Price Range",
+                value=f"**Min:** {min_price}\n**Max:** {max_price}",
+                inline=False
+            )
+        
+        # Fee breakdown
+        fee_breakdown = f"**Total Required:** {total_fee:.4f} SOL\n\n"
+        
+        if refundable_fee > 0:
+            fee_breakdown += f"✅ **Refundable:** {refundable_fee:.4f} SOL\n"
+            if fees.get('position_rent_sol', 0) > 0:
+                fee_breakdown += f"   • Position Rent: {fees.get('position_rent_sol', 0):.4f} SOL\n"
+            if fees.get('extension_rent_sol', 0) > 0:
+                fee_breakdown += f"   • Extension Rent: {fees.get('extension_rent_sol', 0):.4f} SOL\n"
+            fee_breakdown += f"   _(Dapat dikembalikan saat close position)_\n\n"
+        
+        if non_refundable_fee > 0:
+            fee_breakdown += f"❌ **Non-Refundable:** {non_refundable_fee:.4f} SOL\n"
+            fee_breakdown += f"   • BinArray Creation: {fees.get('binarray_rent_sol', 0):.4f} SOL\n"
+            fee_breakdown += f"   _(Tidak dapat dikembalikan, hanya jika create binArray baru)_\n"
+        else:
+            fee_breakdown += f"❌ **Non-Refundable:** 0 SOL\n"
+            fee_breakdown += f"   _(Semua binArrays sudah ada)_\n"
+        
+        preview_embed.add_field(
+            name="💵 Fee Breakdown",
+            value=fee_breakdown,
+            inline=False
+        )
+        
+        preview_embed.set_footer(
+            text="⚠️ Pastikan wallet memiliki cukup SOL untuk fees sebelum confirm!"
+        )
+        
+        # Create confirmation buttons
+        class ConfirmAddLiquidityView(View):
+            def __init__(self, agent, preview_data, slippage_bps):
+                super().__init__(timeout=300)  # 5 minutes timeout
+                self.agent = agent
+                self.preview_data = preview_data
+                self.slippage_bps = slippage_bps
+                self.confirmed = False
+            
+            @discord.ui.button(label="✅ Confirm & Add", style=discord.ButtonStyle.green)
+            async def confirm_button(self, button_interaction: discord.Interaction, button: Button):
+                if button_interaction.user != interaction.user:
+                    await button_interaction.response.send_message("❌ Hanya user yang memulai command ini yang bisa confirm!", ephemeral=True)
+                    return
+                
+                await button_interaction.response.defer(ephemeral=True)
+                
+                # Execute add liquidity
+                success, tx_signature, message = await self.agent.add_liquidity(
+                    pool_address=self.preview_data['pool_address'],
+                    token_x_amount=self.preview_data['token_x_amount'],
+                    token_y_amount=self.preview_data['token_y_amount'],
+                    token_x_mint=self.preview_data['token_x_mint'],
+                    token_y_mint=self.preview_data['token_y_mint'],
+                    strategy_type=self.preview_data['strategy_type'],
+                    min_price=self.preview_data.get('min_price'),
+                    max_price=self.preview_data.get('max_price'),
+                    slippage_bps=self.slippage_bps,
+                    position_address=self.preview_data.get('position_address'),
+                    skip_fee_preview=True
+                )
+                
+                if success and tx_signature:
+                    success_embed = discord.Embed(
+                        title="✅ Add Liquidity Success",
+                        description=f"Liquidity berhasil ditambahkan ke pool",
+                        color=0x00ff00
+                    )
+                    success_embed.add_field(
+                        name="📊 Details",
+                        value=(
+                            f"**Pool:** `{self.preview_data['pool_address'][:8]}...`\n"
+                            f"**Token X:** {self.preview_data['token_x_amount']} (`{self.preview_data['token_x_mint'][:8]}...`)\n"
+                            f"**Token Y:** {self.preview_data['token_y_amount']} (`{self.preview_data['token_y_mint'][:8]}...`)\n"
+                            f"**Strategy:** {self.preview_data['strategy_type'].upper()}\n"
+                            f"**Slippage:** {self.slippage_bps / 100}%"
+                        ),
+                        inline=False
+                    )
+                    
+                    fees = self.preview_data.get('fees', {})
+                    if fees.get('total_fee_sol', 0) > 0:
+                        success_embed.add_field(
+                            name="💵 Fees Paid",
+                            value=(
+                                f"**Total:** {fees.get('total_fee_sol', 0):.4f} SOL\n"
+                                f"✅ Refundable: {fees.get('refundable_fee_sol', 0):.4f} SOL\n"
+                                f"❌ Non-Refundable: {fees.get('non_refundable_fee_sol', 0):.4f} SOL"
+                            ),
+                            inline=False
+                        )
+                    
+                    success_embed.add_field(
+                        name="🔗 Transaction",
+                        value=f"[View on Solscan](https://solscan.io/tx/{tx_signature})",
+                        inline=False
+                    )
+                    
+                    # Disable buttons
+                    for item in self.children:
+                        item.disabled = True
+                    
+                    await button_interaction.followup.send(embed=success_embed)
+                    await interaction.edit_original_response(embed=preview_embed, view=self)
+                else:
+                    await button_interaction.followup.send(
+                        f"❌ **Add Liquidity Failed**\n\n{message}",
+                        ephemeral=True
+                    )
+            
+            @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.red)
+            async def cancel_button(self, button_interaction: discord.Interaction, button: Button):
+                if button_interaction.user != interaction.user:
+                    await button_interaction.response.send_message("❌ Hanya user yang memulai command ini yang bisa cancel!", ephemeral=True)
+                    return
+                
+                await button_interaction.response.defer(ephemeral=True)
+                
+                # Disable buttons
+                for item in self.children:
+                    item.disabled = True
+                
+                cancel_embed = discord.Embed(
+                    title="❌ Cancelled",
+                    description="Add liquidity dibatalkan",
+                    color=0xff0000
+                )
+                
+                await button_interaction.followup.send(embed=cancel_embed, ephemeral=True)
+                await interaction.edit_original_response(embed=preview_embed, view=self)
+        
+        view = ConfirmAddLiquidityView(agent, preview, slippage_bps)
+        await interaction.followup.send(embed=preview_embed, view=view)
+        
+    except Exception as e:
+        print(f"[LP_AGENT] Error in lp_add: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="lp_remove", description="➖ Remove liquidity dari LP position")
+@app_commands.describe(
+    position_address="Address LP position",
+    pool_address="Address pool Meteora DLMM (required)",
+    liquidity_percentage="Percentage liquidity to remove (0-100, default: 100 = all)",
+    from_bin_id="Start bin ID untuk remove (opsional)",
+    to_bin_id="End bin ID untuk remove (opsional)",
+    claim_and_close="Claim fees dan close position setelah remove (default: false)"
+)
+@app_commands.check(_lp_admin_check)
+async def lp_remove(
+    interaction: discord.Interaction,
+    position_address: str,
+    pool_address: str,
+    liquidity_percentage: float = 100.0,
+    from_bin_id: Optional[int] = None,
+    to_bin_id: Optional[int] = None,
+    claim_and_close: bool = False
+):
+    """Remove liquidity dari LP position"""
+    if not LP_AGENT_AVAILABLE:
+        await interaction.response.send_message("❌ LP Agent tidak tersedia.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        agent = get_lp_agent()
+        if not agent or not agent.keypair:
+            await interaction.followup.send(
+                "❌ LP Agent tidak terinisialisasi. Set LP_WALLET_PRIVATE_KEY environment variable.",
+                ephemeral=True
+            )
+            return
+        
+        # Validate addresses
+        if not is_valid_solana_address(position_address):
+            await interaction.followup.send("❌ Invalid position address!", ephemeral=True)
+            return
+        
+        if not is_valid_solana_address(pool_address):
+            await interaction.followup.send("❌ Invalid pool address!", ephemeral=True)
+            return
+        
+        # Validate percentage
+        if liquidity_percentage < 0 or liquidity_percentage > 100:
+            await interaction.followup.send("❌ Liquidity percentage must be between 0 and 100!", ephemeral=True)
+            return
+        
+        # Remove liquidity
+        success, tx_signature, message = await agent.remove_liquidity(
+            position_address=position_address,
+            pool_address=pool_address,
+            liquidity_percentage=liquidity_percentage,
+            from_bin_id=from_bin_id,
+            to_bin_id=to_bin_id,
+            should_claim_and_close=claim_and_close
+        )
+        
+        if success and tx_signature:
+            embed = discord.Embed(
+                title="✅ Remove Liquidity Success",
+                description=f"Liquidity berhasil dihapus dari position",
+                color=0x00ff00
+            )
+            embed.add_field(
+                name="📊 Details",
+                value=(
+                    f"**Position:** `{position_address[:8]}...`\n"
+                    f"**Percentage:** {liquidity_percentage}%\n"
+                    f"**Claim & Close:** {'Yes' if claim_and_close else 'No'}"
+                ),
+                inline=False
+            )
+            if from_bin_id is not None and to_bin_id is not None:
+                embed.add_field(
+                    name="📈 Bin Range",
+                    value=f"**From:** {from_bin_id}\n**To:** {to_bin_id}",
+                    inline=False
+                )
+            embed.add_field(
+                name="🔗 Transaction",
+                value=f"[View on Solscan](https://solscan.io/tx/{tx_signature})",
+                inline=False
+            )
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(
+                f"❌ **Remove Liquidity Failed**\n\n{message}",
+                ephemeral=True
+            )
+        
+    except Exception as e:
+        print(f"[LP_AGENT] Error in lp_remove: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@lp_pool_info.error
+@lp_positions.error
+@lp_returns.error
+@lp_monitor.error
+@lp_add.error
+@lp_remove.error
+async def lp_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Error handler untuk LP commands"""
+    if isinstance(error, app_commands.CheckFailure):
+        # Permission check failed
+        await interaction.response.send_message(
+            f"❌ {str(error)}",
+            ephemeral=True
+        )
+    elif isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True
+        )
+    else:
+        # Only send error if interaction hasn't been responded to
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"❌ Error: {str(error)}",
+                ephemeral=True
+            )
+        else:
+            # If already responded, use followup
+            await interaction.followup.send(
+                f"❌ Error: {str(error)}",
+                ephemeral=True
+            )
 
 # --- RUN BOT ---
 print("[DEBUG] Bot starting...")
