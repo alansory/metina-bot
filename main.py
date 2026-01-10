@@ -12,7 +12,7 @@ import random
 from collections import deque
 from discord import app_commands
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # --- TOKEN ---
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
@@ -4346,9 +4346,10 @@ async def before_poll_launches():
 # --- ICO TRACKER BACKGROUND TASK ---
 # ============================================================================
 
-async def send_ico_notification(ico_data: Dict, notification_type: str = "daily"):
+async def send_ico_notification(ico_data: Dict, notification_type: str = "daily", ico_id: str = None):
     """Send ICO notification to channel.
     notification_type: 'daily', 'hour_warning', 'ended'
+    ico_id: Optional ICO ID for refresh button functionality
     """
     channel_id = ICO_TRACKER_CHANNEL_ID or DAMM_CHANNEL_ID or BOT_CALL_CHANNEL_ID
     if not channel_id:
@@ -4373,9 +4374,13 @@ async def send_ico_notification(ico_data: Dict, notification_type: str = "daily"
         time_remaining_str = "N/A"
         if end_time_str:
             try:
+                # Parse end_time and ensure it's treated as UTC
                 end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
-                now = datetime.now(end_time.tzinfo) if end_time.tzinfo else datetime.utcnow()
-                diff = end_time - now.replace(tzinfo=None) if not end_time.tzinfo else end_time - now
+                if end_time.tzinfo is None:
+                    # If no timezone info, assume it's UTC
+                    end_time = end_time.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                diff = end_time - now
                 
                 total_seconds = int(diff.total_seconds())
                 if total_seconds > 0:
@@ -4446,12 +4451,147 @@ async def send_ico_notification(ico_data: Dict, notification_type: str = "daily"
         
         embed.set_footer(text=f"ICO Tracker | {ico_name}")
         
+        # Create refresh button view if ICO is still ongoing
+        view = None
+        if notification_type != "ended" and ico_id:
+            class RefreshICOView(discord.ui.View):
+                def __init__(self, ico_id: str):
+                    super().__init__(timeout=None)
+                    self.ico_id = ico_id
+                
+                @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary)
+                async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+                    await interaction.response.defer()
+                    
+                    try:
+                        # Access global ico_tracker_list
+                        global ico_tracker_list
+                        
+                        # Get latest ICO data
+                        if self.ico_id not in ico_tracker_list:
+                            await interaction.followup.send("❌ ICO tidak ditemukan lagi di tracker!", ephemeral=True)
+                            return
+                        
+                        latest_ico_data = ico_tracker_list[self.ico_id]
+                        
+                        # Recalculate time remaining
+                        end_time_str = latest_ico_data.get("end_time", "")
+                        time_remaining_str = "N/A"
+                        total_seconds = 0
+                        is_ended = False
+                        
+                        if end_time_str:
+                            try:
+                                # Parse end_time and ensure it's treated as UTC
+                                end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+                                if end_time.tzinfo is None:
+                                    # If no timezone info, assume it's UTC
+                                    end_time = end_time.replace(tzinfo=timezone.utc)
+                                now = datetime.now(timezone.utc)
+                                diff = end_time - now
+                                
+                                total_seconds = int(diff.total_seconds())
+                                if total_seconds > 0:
+                                    days = total_seconds // 86400
+                                    hours = (total_seconds % 86400) // 3600
+                                    minutes = (total_seconds % 3600) // 60
+                                    
+                                    if days > 0:
+                                        time_remaining_str = f"{days}D {hours}H {minutes}M"
+                                    elif hours > 0:
+                                        time_remaining_str = f"{hours}H {minutes}M"
+                                    else:
+                                        time_remaining_str = f"{minutes} menit"
+                                else:
+                                    time_remaining_str = "ENDED"
+                                    is_ended = True
+                            except:
+                                pass
+                        
+                        # Get updated values
+                        latest_name = latest_ico_data.get("name", "Unknown")
+                        latest_symbol = latest_ico_data.get("token_symbol", "???")
+                        latest_target = latest_ico_data.get("target", 0)
+                        latest_committed = latest_ico_data.get("committed", 0)
+                        latest_url = latest_ico_data.get("url", "")
+                        latest_token_address = latest_ico_data.get("token_address", "")
+                        
+                        # Format updated values
+                        target_str = f"${latest_target:,.0f}" if latest_target else "N/A"
+                        committed_str = f"${latest_committed:,.0f}" if latest_committed else "N/A"
+                        progress_pct = (latest_committed / latest_target * 100) if latest_target and latest_committed else 0
+                        
+                        # Update embed based on status
+                        if is_ended or time_remaining_str == "ENDED":
+                            new_title = f"🏁 ICO ENDED: {latest_symbol}"
+                            new_description = f"**{latest_name}** ICO sudah berakhir!"
+                            new_color = 0x888888  # Gray
+                        elif total_seconds > 0 and total_seconds <= 3600:  # Less than 1 hour
+                            new_title = f"⏰ ICO ENDING SOON! {latest_symbol}"
+                            new_description = (
+                                f"**{latest_name}** ICO akan berakhir dalam **{time_remaining_str}**!\n\n"
+                                f"🚨 **LAST CHANCE TO PARTICIPATE!**"
+                            )
+                            new_color = 0xFF6600  # Orange
+                        else:
+                            new_title = f"📊 ICO Update: {latest_symbol}"
+                            new_description = (
+                                f"**{latest_name}** ICO masih berlangsung!\n\n"
+                                f"⏱️ Sisa waktu: **{time_remaining_str}**"
+                            )
+                            new_color = 0x00AAFF  # Blue
+                        
+                        # Create updated embed
+                        updated_embed = discord.Embed(
+                            title=new_title,
+                            description=new_description,
+                            color=new_color,
+                            timestamp=datetime.utcnow()
+                        )
+                        
+                        updated_embed.add_field(name="💰 Committed", value=committed_str, inline=True)
+                        updated_embed.add_field(name="🎯 Target", value=target_str, inline=True)
+                        updated_embed.add_field(name="📈 Progress", value=f"{progress_pct:.1f}%", inline=True)
+                        updated_embed.add_field(name="⏱️ Time Left", value=time_remaining_str, inline=True)
+                        
+                        # Links
+                        links = []
+                        if latest_url:
+                            links.append(f"[🍎 MetaDAO ICO]({latest_url})")
+                        if latest_token_address:
+                            links.extend([
+                                f"[🔍 Solscan](https://solscan.io/token/{latest_token_address})",
+                                f"[📊 GMGN](https://gmgn.ai/sol/token/{latest_token_address})"
+                            ])
+                        
+                        if links:
+                            updated_embed.add_field(name="🔗 Links", value="\n".join(links), inline=False)
+                        
+                        updated_embed.set_footer(text=f"ICO Tracker | {latest_name} | Updated")
+                        
+                        # Update view - remove button if ended
+                        if is_ended or time_remaining_str == "ENDED":
+                            new_view = None
+                        else:
+                            new_view = self
+                        
+                        await interaction.message.edit(embed=updated_embed, view=new_view)
+                        await interaction.followup.send("✅ ICO info diperbarui!", ephemeral=True)
+                        
+                    except Exception as e:
+                        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+                        print(f"[ICO_TRACKER] Error refreshing ICO: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            view = RefreshICOView(ico_id)
+        
         # Mention role for hour warning
         mention_text = ""
         if notification_type == "hour_warning" and MENTION_ROLE_ID:
             mention_text = f"<@&{MENTION_ROLE_ID}> "
         
-        await channel.send(content=f"{mention_text}", embed=embed)
+        await channel.send(content=f"{mention_text}", embed=embed, view=view)
         print(f"[ICO_TRACKER] Sent {notification_type} notification for {ico_name}")
         
     except Exception as e:
@@ -4471,9 +4611,9 @@ async def poll_ico_tracker():
         return
     
     print(f"[ICO_TRACKER] Checking {len(ico_tracker_list)} tracked ICO(s)...")
-    now = datetime.utcnow()
-    today_str = now.strftime("%Y-%m-%d")
-    print(f"[ICO_TRACKER] Current UTC time: {now.isoformat()}")
+    now_utc = datetime.now(timezone.utc)
+    today_str = now_utc.strftime("%Y-%m-%d")
+    print(f"[ICO_TRACKER] Current UTC time: {now_utc.isoformat()}")
     
     for ico_id, ico_data in list(ico_tracker_list.items()):
         try:
@@ -4484,13 +4624,15 @@ async def poll_ico_tracker():
             # Parse end time
             try:
                 end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
-                end_time_naive = end_time.replace(tzinfo=None) if end_time.tzinfo else end_time
+                if end_time.tzinfo is None:
+                    # If no timezone info, assume it's UTC
+                    end_time = end_time.replace(tzinfo=timezone.utc)
             except:
                 print(f"[ICO_TRACKER] Invalid end_time for {ico_id}")
                 continue
             
             # Calculate time remaining
-            diff = end_time_naive - now
+            diff = end_time - now_utc
             total_seconds = int(diff.total_seconds())
             
             # Debug log
@@ -4502,7 +4644,7 @@ async def poll_ico_tracker():
             if total_seconds <= 0:
                 # Send ended notification if not sent
                 if not ico_data.get("ended_notified"):
-                    await send_ico_notification(ico_data, "ended")
+                    await send_ico_notification(ico_data, "ended", ico_id)
                     ico_tracker_list[ico_id]["ended_notified"] = True
                     save_ico_tracker_state()
                 continue
@@ -4511,7 +4653,7 @@ async def poll_ico_tracker():
             if 1800 <= total_seconds <= 5400:  # 30-90 minutes
                 if not ico_data.get("hour_reminder_sent"):
                     print(f"[ICO_TRACKER] 🚨 Sending 1-hour warning for {ico_data.get('name')}")
-                    await send_ico_notification(ico_data, "hour_warning")
+                    await send_ico_notification(ico_data, "hour_warning", ico_id)
                     ico_tracker_list[ico_id]["hour_reminder_sent"] = True
                     save_ico_tracker_state()
             
@@ -4519,7 +4661,7 @@ async def poll_ico_tracker():
             daily_notified = ico_data.get("daily_notified_dates", [])
             if today_str not in daily_notified:
                 print(f"[ICO_TRACKER] 📊 Sending daily update for {ico_data.get('name')}")
-                await send_ico_notification(ico_data, "daily")
+                await send_ico_notification(ico_data, "daily", ico_id)
                 
                 # Update notified dates
                 if "daily_notified_dates" not in ico_tracker_list[ico_id]:
@@ -5477,7 +5619,7 @@ async def launch_add(
     launch_tracker_tokens[token_address] = {
         "name": name or "Unknown",
         "symbol": symbol or "???",
-        "added_at": datetime.utcnow().isoformat(),
+        "added_at": datetime.now(timezone.utc).isoformat(),
         "added_by": str(interaction.user),
         "status": "tracking",
         "existing_pools": existing_pool_addresses  # Save existing pools to skip later
@@ -5751,9 +5893,9 @@ async def ico_add(
     # Generate ICO ID
     ico_id = f"{token_symbol.upper()}-{int(time.time())}"
     
-    # Calculate end time
+    # Calculate end time (using UTC)
     total_seconds = (days_remaining * 86400) + (hours_remaining * 3600)
-    end_time = datetime.utcnow() + timedelta(seconds=total_seconds)
+    end_time = datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
     end_time_str = end_time.isoformat()
     
     # Create ICO entry
@@ -5765,7 +5907,7 @@ async def ico_add(
         "committed": committed or 0,
         "url": url or "",
         "token_address": token_address or "",
-        "added_at": datetime.utcnow().isoformat(),
+        "added_at": datetime.now(timezone.utc).isoformat(),
         "added_by": str(interaction.user),
         "daily_notified_dates": [],
         "hour_reminder_sent": False,
@@ -5831,10 +5973,10 @@ async def ico_list(interaction: discord.Interaction):
         title="🍎 ICO Tracker",
         description=f"**{len(ico_tracker_list)}** ICO sedang di-track",
         color=0xFF6B6B,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc)
     )
     
-    now = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     
     for ico_id, data in list(ico_tracker_list.items())[:10]:
         name = data.get("name", "Unknown")
@@ -5849,9 +5991,12 @@ async def ico_list(interaction: discord.Interaction):
         status_emoji = "🟢"
         if end_time_str:
             try:
+                # Parse end_time and ensure it's treated as UTC
                 end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
-                end_naive = end_time.replace(tzinfo=None) if end_time.tzinfo else end_time
-                diff = end_naive - now
+                if end_time.tzinfo is None:
+                    # If no timezone info, assume it's UTC
+                    end_time = end_time.replace(tzinfo=timezone.utc)
+                diff = end_time - now_utc
                 total_seconds = int(diff.total_seconds())
                 
                 if total_seconds <= 0:
@@ -5955,7 +6100,7 @@ async def ico_notify(
     await interaction.response.defer(ephemeral=True)
     
     try:
-        await send_ico_notification(ico_tracker_list[ico_id], notification_type)
+        await send_ico_notification(ico_tracker_list[ico_id], notification_type, ico_id)
         await interaction.followup.send(f"✅ Notifikasi `{notification_type}` dikirim!", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
