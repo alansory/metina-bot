@@ -451,6 +451,167 @@ async def get_token_price(token_address: str) -> Optional[float]:
     
     return None
 
+async def fetch_token_safety(token_address: str) -> Optional[Dict]:
+    """Fetch token safety data from deepnets.ai API."""
+    global http_session
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    
+    try:
+        url = f"https://api.deepnets.ai/api/token-safety/{token_address}"
+        async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if response.status == 200:
+                data = await response.json()
+                return data
+            else:
+                print(f"[TOKEN_SAFETY] API returned status {response.status}")
+                return None
+    except asyncio.TimeoutError:
+        print(f"[TOKEN_SAFETY] Timeout fetching safety data for {token_address}")
+        return None
+    except Exception as e:
+        print(f"[TOKEN_SAFETY] Error fetching safety data: {e}")
+        return None
+
+def create_token_safety_embeds(safety_data: Dict) -> List[discord.Embed]:
+    """Create Discord embeds for token safety information."""
+    embeds = []
+    
+    # Determine safety level color
+    safety_level = safety_data.get("overallSafetyLevel", "UNKNOWN")
+    if safety_level == "SAFE":
+        color = 0x00ff00  # Green
+    elif safety_level == "RISKY":
+        color = 0xff9900  # Orange
+    elif safety_level == "CRITICAL":
+        color = 0xff0000  # Red
+    else:
+        color = 0x808080  # Gray
+    
+    # First embed: Token Properties
+    properties_embed = discord.Embed(
+        title="🛡️ Token Safety Analysis",
+        color=color
+    )
+    
+    # Token info
+    token_name = safety_data.get("tokenName", "Unknown")
+    token_symbol = safety_data.get("tokenSymbol", "Unknown")
+    properties_embed.add_field(
+        name="Token",
+        value=f"**{token_name}** ({token_symbol})",
+        inline=False
+    )
+    
+    # Token properties
+    is_mintable = safety_data.get("isMintable", False)
+    is_freezable = safety_data.get("isFreezable", False)
+    is_metadata_mutable = safety_data.get("isMetadataMutable", False)
+    
+    mintable_status = "✅ No" if not is_mintable else "❌ Yes"
+    freezable_status = "✅ No" if not is_freezable else "❌ Yes"
+    metadata_status = "✅ No" if not is_metadata_mutable else "❌ Yes"
+    
+    properties_embed.add_field(
+        name="Mintable",
+        value=mintable_status,
+        inline=True
+    )
+    properties_embed.add_field(
+        name="Freezable",
+        value=freezable_status,
+        inline=True
+    )
+    properties_embed.add_field(
+        name="Metadata Mutable",
+        value=metadata_status,
+        inline=True
+    )
+    
+    # Token properties analysis
+    token_props_analysis = safety_data.get("tokenPropertiesAnalysis", "")
+    if token_props_analysis:
+        properties_embed.add_field(
+            name="Properties Analysis",
+            value=token_props_analysis,
+            inline=False
+        )
+    
+    embeds.append(properties_embed)
+    
+    # Second embed: RugCheck Score and Warnings
+    score_embed = discord.Embed(
+        title="📊 RugCheck Score",
+        color=color
+    )
+    
+    rugcheck_score = safety_data.get("rugcheckScore", 0)
+    score_embed.add_field(
+        name="Overall Safety",
+        value=f"**{safety_level}** - Score: {rugcheck_score}/100",
+        inline=False
+    )
+    
+    # Warnings
+    warnings = safety_data.get("warnings", [])
+    critical_risks = safety_data.get("criticalRisks", [])
+    
+    if critical_risks:
+        score_embed.add_field(
+            name="⚠️ Critical Risks",
+            value="\n".join([f"• {risk}" for risk in critical_risks]),
+            inline=False
+        )
+    
+    if warnings:
+        score_embed.add_field(
+            name="⚠️ Warnings",
+            value="\n".join([f"• {warning}" for warning in warnings]),
+            inline=False
+        )
+    
+    # RugCheck risks
+    rugcheck_risks = safety_data.get("rugCheckRisks", [])
+    if rugcheck_risks:
+        score_embed.add_field(
+            name="RugCheck Risks",
+            value="\n".join([f"• {risk}" for risk in rugcheck_risks]),
+            inline=False
+        )
+    
+    # Holder distribution info
+    top_holder_ownership = safety_data.get("topHolderOwnership")
+    top_ten_ownership = safety_data.get("topTenOwnership")
+    top_network_ownership = safety_data.get("topNetworkOwnership")
+    
+    if top_holder_ownership or top_ten_ownership or top_network_ownership:
+        holder_info = []
+        if top_holder_ownership:
+            holder_info.append(f"Top holder: {top_holder_ownership:.1f}%")
+        if top_ten_ownership:
+            holder_info.append(f"Top 10 holders: {top_ten_ownership:.1f}%")
+        if top_network_ownership:
+            holder_info.append(f"Top network: {top_network_ownership:.1f}%")
+        
+        score_embed.add_field(
+            name="Holder Distribution",
+            value="\n".join(holder_info),
+            inline=False
+        )
+    
+    # Liquidity analysis
+    liquidity_analysis = safety_data.get("liquidityAnalysis", "")
+    if liquidity_analysis:
+        score_embed.add_field(
+            name="Liquidity Analysis",
+            value=liquidity_analysis,
+            inline=False
+        )
+    
+    embeds.append(score_embed)
+    
+    return embeds
+
 async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int = 300) -> Optional[Dict]:
     """Get swap quote from Jupiter API."""
     global http_session
@@ -6415,6 +6576,19 @@ async def on_message(message: discord.Message):
                     await message.channel.send(embed=embed)
                     print(f"[DEBUG] ✅ Embed sent successfully!")
                     sys.stdout.flush()
+                    
+                    # Fetch and display token safety information
+                    print(f"[DEBUG] Fetching token safety data for {content}")
+                    safety_data = await fetch_token_safety(content)
+                    if safety_data:
+                        safety_embeds = create_token_safety_embeds(safety_data)
+                        for safety_embed in safety_embeds:
+                            try:
+                                await message.channel.send(embed=safety_embed)
+                            except Exception as e:
+                                print(f"[ERROR] Failed to send safety embed: {e}")
+                    else:
+                        print(f"[DEBUG] No safety data available for {content}")
                 except discord.Forbidden:
                     print(f"[ERROR] Bot tidak punya permission untuk kirim pesan di channel ini")
                     raise
@@ -6699,6 +6873,19 @@ async def call_token(ctx: commands.Context, ca: str):
         await thread.send(f"{mention_text}", embed=contract_embed)
 
         await thread.send(embed=embed)
+        
+        # Fetch and display token safety information
+        print(f"[DEBUG] Fetching token safety data for !call command: {ca}")
+        safety_data = await fetch_token_safety(ca)
+        if safety_data:
+            safety_embeds = create_token_safety_embeds(safety_data)
+            for safety_embed in safety_embeds:
+                try:
+                    await thread.send(embed=safety_embed)
+                except Exception as e:
+                    print(f"[ERROR] Failed to send safety embed in !call: {e}")
+        else:
+            print(f"[DEBUG] No safety data available for {ca}")
 
         thread_link = f"https://discord.com/channels/{ctx.guild.id}/{thread.id}"
 
