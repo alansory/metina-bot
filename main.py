@@ -473,7 +473,7 @@ async def fetch_token_safety(token_address: str) -> Optional[Dict]:
         print(f"[TOKEN_SAFETY] Error fetching safety data: {e}")
         return None
 
-def create_token_safety_embeds(safety_data: Dict) -> List[discord.Embed]:
+def create_token_safety_embeds(safety_data: Dict, token_address: str = None) -> List[discord.Embed]:
     """Create Discord embeds for token safety information."""
     embeds = []
     
@@ -611,6 +611,18 @@ def create_token_safety_embeds(safety_data: Dict) -> List[discord.Embed]:
         score_embed.add_field(
             name="Liquidity Analysis",
             value=liquidity_analysis,
+            inline=False
+        )
+    
+    # Add links to Deepnets.ai and GMGN if token_address is provided
+    if token_address:
+        links_value = (
+            f"[🔍 Deepnets.ai](https://deepnets.ai/token/{token_address})\n"
+            f"[📊 GMGN Token Details](https://gmgn.ai/sol/token/{token_address})"
+        )
+        score_embed.add_field(
+            name="🔗 Links",
+            value=links_value,
             inline=False
         )
     
@@ -6587,7 +6599,7 @@ async def on_message(message: discord.Message):
                     print(f"[DEBUG] Fetching token safety data for {content}")
                     safety_data = await fetch_token_safety(content)
                     if safety_data:
-                        safety_embeds = create_token_safety_embeds(safety_data)
+                        safety_embeds = create_token_safety_embeds(safety_data, content)
                         for safety_embed in safety_embeds:
                             try:
                                 await message.channel.send(embed=safety_embed)
@@ -6884,7 +6896,7 @@ async def call_token(ctx: commands.Context, ca: str):
         print(f"[DEBUG] Fetching token safety data for !call command: {ca}")
         safety_data = await fetch_token_safety(ca)
         if safety_data:
-            safety_embeds = create_token_safety_embeds(safety_data)
+            safety_embeds = create_token_safety_embeds(safety_data, ca)
             for safety_embed in safety_embeds:
                 try:
                     await thread.send(embed=safety_embed)
