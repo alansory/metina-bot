@@ -479,7 +479,7 @@ def create_token_safety_embeds(safety_data: Dict) -> List[discord.Embed]:
     
     # Determine safety level color
     safety_level = safety_data.get("overallSafetyLevel", "UNKNOWN")
-    if safety_level == "SAFE":
+    if safety_level == "SAFE" or safety_level == "OK":
         color = 0x00ff00  # Green
     elif safety_level == "RISKY":
         color = 0xff9900  # Orange
@@ -546,9 +546,13 @@ def create_token_safety_embeds(safety_data: Dict) -> List[discord.Embed]:
     )
     
     rugcheck_score = safety_data.get("rugcheckScore", 0)
+    
+    # Format safety level - simple and clean like the image
+    safety_display = f"**{safety_level}** - Score: {rugcheck_score}/100"
+    
     score_embed.add_field(
-        name="Overall Safety",
-        value=f"**{safety_level}** - Score: {rugcheck_score}/100",
+        name="⚠️ Overall Safety",
+        value=safety_display,
         inline=False
     )
     
@@ -564,18 +568,20 @@ def create_token_safety_embeds(safety_data: Dict) -> List[discord.Embed]:
         )
     
     if warnings:
+        warnings_text = "\n".join([f"• {warning}" for warning in warnings])
         score_embed.add_field(
             name="⚠️ Warnings",
-            value="\n".join([f"• {warning}" for warning in warnings]),
+            value=warnings_text,
             inline=False
         )
     
     # RugCheck risks
     rugcheck_risks = safety_data.get("rugCheckRisks", [])
     if rugcheck_risks:
+        risks_text = "\n".join([f"• {risk}" for risk in rugcheck_risks])
         score_embed.add_field(
             name="RugCheck Risks",
-            value="\n".join([f"• {risk}" for risk in rugcheck_risks]),
+            value=risks_text,
             inline=False
         )
     
