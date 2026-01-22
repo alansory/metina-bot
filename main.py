@@ -162,7 +162,7 @@ TRACK_WALLET_CHANNEL_ID = 1437712394200809482  # Channel private untuk track wal
 BOT_CALL_CHANNEL_ID = int(os.getenv("BOT_CALL_CHANNEL_ID", "1443433566058053662")) or None  # Channel untuk notifikasi token baru
 BOT_CALL_MIN_MARKET_CAP = float(os.getenv("BOT_CALL_MIN_MARKET_CAP", "250000"))  # Minimum market cap: 250k USD
 BOT_CALL_MAX_MARKET_CAP = float(os.getenv("BOT_CALL_MAX_MARKET_CAP", "10000000"))  # Maximum market cap: 10jt USD
-BOT_CALL_MIN_FEES_SOL = float(os.getenv("BOT_CALL_MIN_FEES_SOL", "20"))  # Minimum total fees: 20 SOL (bukan USD)
+BOT_CALL_MIN_FEES_SOL = float(os.getenv("BOT_CALL_MIN_FEES_SOL", "10"))  # Minimum total fees: 20 SOL (bukan USD)
 BOT_CALL_MIN_PRICE_CHANGE_1H = float(os.getenv("BOT_CALL_MIN_PRICE_CHANGE_1H", "20"))  # Minimum price change 1h: 50%
 BOT_CALL_POLL_INTERVAL_MINUTES = int(os.getenv("BOT_CALL_POLL_INTERVAL", "5"))  # Poll setiap 2 menit
 BOT_CALL_STATE_FILE = "bot_call_state.json"  # File untuk simpan state token yang sudah di-notifikasi
@@ -2393,6 +2393,15 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                 except:
                     print(f"[DEBUG]   {i}. {token_symbol} ({token_id[:8]}...): mcap=N/A")
             
+            # Log structure of first token to see available fields (especially fees)
+            if tokens and len(tokens) > 0:
+                first_token = tokens[0]
+                print(f"[DEBUG] First token structure keys: {list(first_token.keys())}")
+                if "stats24h" in first_token and isinstance(first_token["stats24h"], dict):
+                    print(f"[DEBUG] stats24h keys: {list(first_token['stats24h'].keys())}")
+                if "stats1h" in first_token and isinstance(first_token["stats1h"], dict):
+                    print(f"[DEBUG] stats1h keys: {list(first_token['stats1h'].keys())}")
+            
             # Check if specific tokens are in the response (for debugging)
             target_tokens = ["3k29upUrDXNF3cuRYArqUKw8AtUNWSqbfZfRvB6fBAGS", "GLBV9FAMhULQpD6iQMGBSchD9s1Hdzd79VqetVjgpump"]
             for target_id in target_tokens:
@@ -2472,6 +2481,31 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                             except (ValueError, TypeError):
                                 price_change_1h = None
                     
+                    # Get fees from Jupiter API response (fees are in SOL, not USD)
+                    jupiter_fees_sol = None
+                    
+                    # Check for fees at token root level first (most common location based on API response)
+                    # Priority: "fees" (most common) -> "fees24h" -> "fees_24h" -> "totalFees" -> "total_fees"
+                    for fee_field in ["fees", "fees24h", "fees_24h", "totalFees", "total_fees"]:
+                        if fee_field in token:
+                            try:
+                                jupiter_fees_sol = float(token[fee_field])
+                                print(f"[DEBUG]   {token_symbol}: Found fees in token.{fee_field}: {jupiter_fees_sol:.4f} SOL")
+                                break
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # Fallback: Check for fees in stats24h if not found at root level
+                    if jupiter_fees_sol is None and stats24h and isinstance(stats24h, dict):
+                        for fee_field in ["fees", "fees24h", "fees_24h", "totalFees", "total_fees"]:
+                            if fee_field in stats24h:
+                                try:
+                                    jupiter_fees_sol = float(stats24h[fee_field])
+                                    print(f"[DEBUG]   {token_symbol}: Found fees in stats24h.{fee_field}: {jupiter_fees_sol:.4f} SOL")
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                    
                     # Try to get volume and fees from Meteora if enabled
                     meteora_volume = None
                     meteora_fees = None
@@ -2482,15 +2516,23 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                     if meteora_volume and meteora_volume > (volume_24h_usd or 0):
                         volume_24h_usd = meteora_volume
                     
-                    # Calculate fees: prefer Meteora fees if available, otherwise calculate from volume
-                    if meteora_fees and meteora_fees > 0:
+                    # Calculate fees: prioritize Jupiter API fees (in SOL), then Meteora (in USD), then calculate from volume
+                    if jupiter_fees_sol and jupiter_fees_sol > 0:
+                        # Jupiter fees are already in SOL, use directly
+                        total_fees_sol = jupiter_fees_sol
+                        total_fees_usd = total_fees_sol * sol_price_usd if sol_price_usd and total_fees_sol > 0 else 0
+                        print(f"[DEBUG]   {token_symbol}: Using fees from Jupiter API: {total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)")
+                    elif meteora_fees and meteora_fees > 0:
+                        # Meteora fees are in USD, convert to SOL
                         total_fees_usd = meteora_fees
+                        total_fees_sol = total_fees_usd / sol_price_usd if sol_price_usd and total_fees_usd > 0 else 0
+                        print(f"[DEBUG]   {token_symbol}: Using fees from Meteora: {total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)")
                     else:
-                        # Calculate fees (0.3% of volume is typical for DEX fees)
+                        # Calculate fees from volume (0.3% of volume is typical for DEX fees)
                         fee_percentage = 0.003
                         total_fees_usd = volume_24h_usd * fee_percentage if volume_24h_usd else 0
-                    
-                    total_fees_sol = total_fees_usd / sol_price_usd if sol_price_usd and total_fees_usd > 0 else 0
+                        total_fees_sol = total_fees_usd / sol_price_usd if sol_price_usd and total_fees_usd > 0 else 0
+                        print(f"[DEBUG]   {token_symbol}: Calculated fees from volume (0.3%): {total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)")
                     
                     # Check criteria with detailed logging
                     market_cap_ok = market_cap and market_cap >= BOT_CALL_MIN_MARKET_CAP and market_cap <= BOT_CALL_MAX_MARKET_CAP
@@ -2501,7 +2543,11 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                     print(f"[DEBUG]   {token_symbol} filter check:")
                     mcap_str = f"${market_cap:,.0f}" if market_cap else "$0"
                     print(f"    - Market cap: {mcap_str} (min: ${BOT_CALL_MIN_MARKET_CAP:,.0f}, max: ${BOT_CALL_MAX_MARKET_CAP:,.0f}) -> {'✅' if market_cap_ok else '❌'}")
-                    print(f"    - Fees: {total_fees_sol:.2f} SOL (min: {BOT_CALL_MIN_FEES_SOL} SOL) -> {'✅' if fees_ok else '❌'}")
+                    
+                    # Show fees source
+                    fees_source = "Jupiter API" if jupiter_fees_sol and jupiter_fees_sol > 0 else ("Meteora" if meteora_fees and meteora_fees > 0 else "Calculated (0.3% of volume)")
+                    print(f"    - Fees: {total_fees_sol:.2f} SOL (${total_fees_usd:,.2f} USD) from {fees_source} (min: {BOT_CALL_MIN_FEES_SOL} SOL) -> {'✅' if fees_ok else '❌'}")
+                    
                     price_change_str = f"{price_change_1h:.2f}%" if price_change_1h is not None else "N/A"
                     print(f"    - Price change 1h: {price_change_str} (min: {BOT_CALL_MIN_PRICE_CHANGE_1H}%) -> {'✅' if price_change_1h_ok else '❌'}")
                     
