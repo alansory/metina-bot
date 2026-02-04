@@ -618,7 +618,7 @@ def create_token_safety_embeds(safety_data: Dict, token_address: str = None) -> 
     if token_address:
         links_value = (
             f"[🔍 Deepnets.ai](https://deepnets.ai/token/{token_address})\n"
-            f"[📊 GMGN Token Details](https://gmgn.ai/sol/token/{token_address})"
+            f"[📊 GMGN](https://gmgn.ai/sol/token/{token_address})"
         )
         score_embed.add_field(
             name="🔗 Links",
@@ -6637,7 +6637,132 @@ async def on_message(message: discord.Message):
                 print(f"[DEBUG] Sending embed with {len(pools[:10])} pools to channel {message.channel.id}")
                 sys.stdout.flush()
                 try:
-                    await message.channel.send(embed=embed)
+                    # Create button view for creating thread
+                    class CreateLPThreadView(discord.ui.View):
+                        def __init__(self, token_address: str, pools_data: List[Dict]):
+                            super().__init__(timeout=None)
+                            self.token_address = token_address
+                            self.pools_data = pools_data
+                        
+                        @discord.ui.button(label="📝 Create LP Call Thread", style=discord.ButtonStyle.primary)
+                        async def create_thread_button(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+                            # Check if user is admin/moderator
+                            admin_roles = ["Moderator", "admin", "Admin"]
+                            user_roles = [role.name for role in button_interaction.user.roles]
+                            is_admin = any(role in admin_roles for role in user_roles)
+                            
+                            if not is_admin:
+                                await button_interaction.response.send_message("❌ Hanya admin yang bisa membuat thread!", ephemeral=True)
+                                return
+                            
+                            await button_interaction.response.defer(ephemeral=True)
+                            
+                            try:
+                                # Get LP Chat channel (untuk buat thread)
+                                lp_chat_channel = bot.get_channel(THREAD_SCAN_CHANNEL_ID)
+                                if not lp_chat_channel:
+                                    await button_interaction.followup.send("❌ LP Chat channel tidak ditemukan!", ephemeral=True)
+                                    return
+                                
+                                # Get LP Calls channel (untuk kirim embed info)
+                                lp_calls_channel = bot.get_channel(ALLOWED_CHANNEL_ID)
+                                if not lp_calls_channel:
+                                    await button_interaction.followup.send("❌ LP Calls channel tidak ditemukan!", ephemeral=True)
+                                    return
+                                
+                                # Create thread name dari pools
+                                if self.pools_data:
+                                    top_pool = self.pools_data[0]
+                                    pair_name = top_pool['pair'].replace(" ", "")
+                                    thread_name = f"{pair_name}"
+                                else:
+                                    thread_name = f"{self.token_address[:8]}-Pool"
+                                
+                                # Create thread di LP Chat
+                                thread = await lp_chat_channel.create_thread(
+                                    name=thread_name,
+                                    type=discord.ChannelType.public_thread,
+                                    reason=f"Thread created by {button_interaction.user} via pool detection button",
+                                    auto_archive_duration=60,
+                                )
+                                
+                                # Track thread untuk auto-archive setelah 15 menit
+                                threads_to_archive[thread.id] = time.time()
+                                print(f"[DEBUG] Thread {thread.id} ditambahkan ke auto-archive queue (15 menit)")
+                                
+                                # Send contract info embed ke thread
+                                contract_embed = discord.Embed(
+                                    title=f"💬 Thread created for `{thread_name}`",
+                                    description=f"**Contract Address:** `{self.token_address}`",
+                                    color=0x3498db
+                                )
+                                contract_embed.add_field(
+                                    name="🔗 Links",
+                                    value=(
+                                        f"[🔍 Solscan](https://solscan.io/token/{self.token_address})\n"
+                                        f"[🪐 Jupiter](https://jup.ag/tokens/{self.token_address})\n"
+                                        f"[📊 GMGN](https://gmgn.ai/sol/token/{self.token_address})"
+                                    ),
+                                    inline=False
+                                )
+                                
+                                mention_text = f"<@&{MENTION_ROLE_ID}>" if MENTION_ROLE_ID else ""
+                                await thread.send(f"{mention_text}", embed=contract_embed)
+                                
+                                # Send Meteora pools embed ke thread
+                                if self.pools_data:
+                                    pool_desc = f"Found {len(self.pools_data)} Meteora DLMM pool untuk `{self.token_address}`\n\n"
+                                    for i, p in enumerate(self.pools_data[:10], 1):
+                                        link = f"https://app.meteora.ag/dlmm/{p['address']}"
+                                        pool_desc += f"{i}. [{p['pair']}]({link}) {p['bin']} - LQ: {p['liq']}\n"
+                                    
+                                    pool_embed = discord.Embed(
+                                        title=f"Meteora DLMM Pools — {thread_name}",
+                                        description=pool_desc,
+                                        color=0x00ff00
+                                    )
+                                    pool_embed.set_footer(text=f"Requested by {button_interaction.user.display_name}")
+                                    await thread.send(embed=pool_embed)
+                                
+                                # Kirim embed info ke LP Calls channel
+                                thread_link = f"https://discord.com/channels/{button_interaction.guild.id}/{thread.id}"
+                                top_pool_info = self.pools_data[0] if self.pools_data else None
+                                
+                                if top_pool_info:
+                                    top_pool_str = f"**Top Pool:** {top_pool_info['pair']} ({top_pool_info['liq']})"
+                                else:
+                                    top_pool_str = "**Top Pool:** N/A"
+                                
+                                info_embed = discord.Embed(
+                                    title=f"🧵 {thread_name}",
+                                    description=(
+                                        f"**Created by:** {button_interaction.user.mention}\n"
+                                        f"**Channel:** {lp_chat_channel.mention}\n"
+                                        f"**Token:** `{self.token_address[:8]}...`\n"
+                                        f"{top_pool_str}\n\n"
+                                        f"[🔗 Open Thread]({thread_link})"
+                                    ),
+                                    color=0x3498db
+                                )
+                                await lp_calls_channel.send(embed=info_embed)
+                                
+                                await button_interaction.followup.send(
+                                    f"✅ Thread berhasil dibuat di {lp_chat_channel.mention}!\n[🔗 Open Thread]({thread_link})",
+                                    ephemeral=True
+                                )
+                                
+                                print(f"[DEBUG] Thread {thread.id} created by {button_interaction.user.name} via pool detection button")
+                                
+                            except discord.Forbidden:
+                                await button_interaction.followup.send("❌ Bot tidak punya izin untuk membuat thread!", ephemeral=True)
+                            except Exception as e:
+                                await button_interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+                                print(f"[ERROR] Error creating thread: {e}")
+                                import traceback
+                                traceback.print_exc()
+                    
+                    view = CreateLPThreadView(content, pools)
+                    await message.channel.send(embed=embed, view=view)
                     print(f"[DEBUG] ✅ Embed sent successfully!")
                     sys.stdout.flush()
                     
