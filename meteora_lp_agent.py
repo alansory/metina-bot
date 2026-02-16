@@ -354,62 +354,54 @@ main();
                     
                 try:
                     print(f"[LP_AGENT] Trying alternative offset: {alt_offset}...")
-            rpc_payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getProgramAccounts",
-                "params": [
-                    METEORA_DLMM_PROGRAM_ID,
-                    {
-                        "encoding": "jsonParsed",
-                        "filters": [
+                    rpc_payload = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getProgramAccounts",
+                        "params": [
+                            METEORA_DLMM_PROGRAM_ID,
                             {
-                                "memcmp": {
+                                "encoding": "jsonParsed",
+                                "filters": [
+                                    {
+                                        "memcmp": {
                                             "offset": alt_offset,
                                             "bytes": wallet_base58
-                                }
+                                        }
+                                    }
+                                ]
                             }
                         ]
                     }
-                ]
-            }
-            
-            async with session.post(
-                RPC_URL,
-                json=rpc_payload,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                            
+                    async with session.post(
+                        RPC_URL,
+                        json=rpc_payload,
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
                             if "error" in result:
                                 continue  # Try next offset
-                            
                             if "result" in result and result["result"]:
-                        positions = []
-                        for account in result["result"]:
+                                positions = []
+                                for account in result["result"]:
                                     account_info = account.get('account', {})
-                                    
-                                    # Verify owner matches
                                     owner = account_info.get('owner')
                                     if owner and owner.lower() == wallet.lower():
                                         position_data = {
-                                'position_address': account.get('pubkey'),
+                                            'position_address': account.get('pubkey'),
                                             'lamports': account_info.get('lamports', 0),
                                             'owner': owner,
                                         }
-                                        
                                         parsed_data = account_info.get('data', {})
                                         if isinstance(parsed_data, dict):
                                             parsed_info = parsed_data.get('parsed', {})
                                             if parsed_info:
                                                 position_data['parsed'] = parsed_info
-                                        
                                         positions.append(position_data)
-                                
                                 if positions:
                                     print(f"[LP_AGENT] ✅ Found {len(positions)} position(s) via offset {alt_offset}")
-                        return positions
+                                    return positions
                         else:
                             if response.status == 429:
                                 print(f"[LP_AGENT] ⚠️ Rate limited, skipping offset {alt_offset}")
@@ -527,7 +519,7 @@ main();
             print(f"   - Solana Explorer: https://solscan.io/account/{wallet}")
             print(f"   - If positions exist but not found, offset might be wrong")
             print(f"   - Try using Meteora SDK for more reliable queries")
-                return []
+            return []
         except Exception as e:
             print(f"[LP_AGENT] Error fetching LP positions: {e}")
             import traceback
