@@ -4103,26 +4103,28 @@ def fetch_meteora_pools(ca: str, max_retries: int = 3):
                                 bin_step = pool.get('bin_step', 0)
                                 address = pool.get('address', '')
                                 
-                                # Get base fee from pool data
-                                # Use base_fee_percentage directly from API (no conversion)
-                                base_fee = None
+                                # Get base fee from pool data (API returns percentage e.g. 0.2 = 0.2%, 5 = 5%)
+                                base_fee_val = None
                                 if 'base_fee_percentage' in pool:
                                     base_fee_percentage = pool.get('base_fee_percentage')
                                     try:
-                                        # Use value directly from API
                                         if isinstance(base_fee_percentage, (int, float)):
-                                            base_fee = int(base_fee_percentage)
+                                            base_fee_val = float(base_fee_percentage)
                                         elif isinstance(base_fee_percentage, str):
-                                            base_fee = int(float(base_fee_percentage))
+                                            base_fee_val = float(base_fee_percentage)
                                     except (ValueError, TypeError):
                                         pass
                                 
-                                # Default to 5 if base_fee not found
-                                if base_fee is None or base_fee == 0:
-                                    base_fee = 5
+                                # Default to 5 only if base_fee not found (do NOT use 5 when value is 0.2 - int(0.2)=0 was wrongly triggering this)
+                                if base_fee_val is None:
+                                    base_fee_val = 5.0
                                 
-                                # Format: bin_step/base_fee (e.g., "100/1", "100/5")
-                                bin_format = f"{bin_step}/{base_fee}"
+                                # Format for display: show as integer if whole number, else 1 decimal (e.g. 80/0.2 or 80/5)
+                                if base_fee_val == int(base_fee_val):
+                                    base_fee_str = str(int(base_fee_val))
+                                else:
+                                    base_fee_str = f"{base_fee_val:.1f}".rstrip('0').rstrip('.')
+                                bin_format = f"{bin_step}/{base_fee_str}"
 
                                 matching_pools.append({
                                     'pair': pair_name,

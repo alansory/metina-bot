@@ -162,8 +162,198 @@ class MeteoraLPAgent:
         session = await self._get_session()
         
         try:
-            # Query program accounts untuk LP positions
-            # Meteora DLMM menggunakan position accounts
+            # Method 1: Try using Meteora SDK if available (query program accounts via SDK)
+            try:
+                from meteora_sdk_wrapper import get_sdk_wrapper
+                sdk_wrapper = get_sdk_wrapper(RPC_URL)
+                
+                if sdk_wrapper.sdk_installed:
+                    # Use SDK to query program accounts
+                    script = f"""
+const {{ Connection, PublicKey }} = require('@solana/web3.js');
+const DLMM = require('@meteora-ag/dlmm');
+
+async function main() {{
+    try {{
+        const connection = new Connection('{RPC_URL}', 'confirmed');
+        const userPublicKey = new PublicKey('{wallet}');
+        const programId = new PublicKey('{METEORA_DLMM_PROGRAM_ID}');
+        
+        // Query all program accounts and filter by owner
+        const accounts = await connection.getProgramAccounts(programId, {{
+            encoding: 'jsonParsed',
+            filters: [
+                {{
+                    memcmp: {{
+                        offset: 8,  // Owner offset after discriminator
+                        bytes: userPublicKey.toBase58()
+                    }}
+                }}
+            ]
+        }});
+        
+        const result = accounts.map(acc => ({{
+            position_address: acc.pubkey.toString(),
+            owner: acc.account.owner.toString(),
+            lamports: acc.account.lamports,
+            data: acc.account.data
+        }}));
+        
+        console.log(JSON.stringify({{ success: true, positions: result }}));
+    }} catch (error) {{
+        console.log(JSON.stringify({{ success: false, error: error.message }}));
+        process.exit(1);
+    }}
+}}
+
+main();
+"""
+                    success, result, error = sdk_wrapper._run_node_script(script)
+                    if success and result and result.get("success"):
+                        positions_data = result.get("positions", [])
+                        if positions_data:
+                            positions = []
+                            for pos in positions_data:
+                                positions.append({
+                                    'position_address': pos.get('position_address'),
+                                    'owner': pos.get('owner'),
+                                    'lamports': pos.get('lamports'),
+                                    'data': pos.get('data'),
+                                })
+                            print(f"[LP_AGENT] ✅ Found {len(positions)} position(s) via SDK")
+                            return positions
+            except ImportError:
+                pass
+            except Exception as sdk_error:
+                print(f"[LP_AGENT] SDK method failed: {sdk_error}, trying RPC...")
+            
+            # Method 2: Query using RPC getProgramAccounts
+            # Meteora DLMM position account structure:
+            # - 8 bytes: discriminator
+            # - 32 bytes: owner (pubkey)
+            # - ... rest of position data
+            
+            # Validate wallet address format
+            try:
+                # Verify it's a valid base58 address
+                wallet_bytes = base58.b58decode(wallet)
+                if len(wallet_bytes) != 32:
+                    print(f"[LP_AGENT] Invalid wallet address: expected 32 bytes, got {len(wallet_bytes)}")
+                    return []
+                wallet_base58 = wallet  # Use original base58 string
+            except Exception as e:
+                print(f"[LP_AGENT] Invalid wallet address format: {e}")
+                return []
+            
+            # Try different offsets and encodings
+            # Meteora DLMM Position account structure:
+            # - 8 bytes: discriminator (account type)
+            # - 32 bytes: owner (pubkey)
+            # So offset 8 should be correct for owner field
+            
+            # For memcmp, Solana RPC expects base58-encoded string
+            filters_to_try = [
+                {
+                    "memcmp": {
+                        "offset": 8,
+                        "bytes": wallet_base58  # Base58 string (standard format)
+                    }
+                }
+            ]
+            
+            for filter_config in filters_to_try:
+                try:
+                    rpc_payload = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getProgramAccounts",
+                        "params": [
+                            METEORA_DLMM_PROGRAM_ID,
+                            {
+                                "encoding": "jsonParsed",
+                                "filters": [filter_config]
+                            }
+                        ]
+                    }
+                    
+                    print(f"[LP_AGENT] Querying positions for wallet: {wallet[:8]}... (offset: {filter_config['memcmp']['offset']})")
+                    
+                    async with session.post(
+                        RPC_URL,
+                        json=rpc_payload,
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            
+                            if "error" in result:
+                                error_msg = result['error']
+                                print(f"[LP_AGENT] RPC error: {error_msg}")
+                                # Don't continue if it's a permanent error
+                                if isinstance(error_msg, dict) and error_msg.get('code') == -32602:
+                                    # Invalid params - try next filter
+                                    continue
+                                else:
+                                    # Other errors - might be temporary, but try next method
+                                    break
+                            
+                            if "result" in result:
+                                if result["result"] is None:
+                                    print(f"[LP_AGENT] No result returned from RPC")
+                                    continue
+                                
+                                positions = []
+                                for account in result["result"]:
+                                    account_info = account.get('account', {})
+                                    
+                                    # Parse position data
+                                    position_data = {
+                                        'position_address': account.get('pubkey'),
+                                        'lamports': account_info.get('lamports', 0),
+                                        'owner': account_info.get('owner'),
+                                    }
+                                    
+                                    # Try to parse parsed data if available
+                                    parsed_data = account_info.get('data', {})
+                                    if isinstance(parsed_data, dict):
+                                        parsed_info = parsed_data.get('parsed', {})
+                                        if parsed_info:
+                                            position_data['parsed'] = parsed_info
+                                            # Extract useful info from parsed data
+                                            info = parsed_info.get('info', {})
+                                            if info:
+                                                position_data['pool'] = info.get('pool')
+                                                position_data['liquidity'] = info.get('liquidity')
+                                    
+                                    positions.append(position_data)
+                                
+                                if positions:
+                                    print(f"[LP_AGENT] ✅ Found {len(positions)} position(s) via RPC")
+                                    return positions
+                                else:
+                                    print(f"[LP_AGENT] Query returned {len(result['result'])} accounts but none matched")
+                        else:
+                            error_text = await response.text()
+                            if response.status == 429:
+                                print(f"[LP_AGENT] ⚠️ Rate limited by RPC. Please wait and try again.")
+                            else:
+                                print(f"[LP_AGENT] HTTP error {response.status}: {error_text}")
+                except Exception as filter_error:
+                    print(f"[LP_AGENT] Filter attempt failed: {filter_error}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            # Method 3: Try with different offset (maybe owner is at different position)
+            # Some programs might have different account structure
+            alternative_offsets = [0, 1, 8, 9, 40]  # Try common offsets
+            
+            for alt_offset in alternative_offsets:
+                if alt_offset == 8:  # Skip, already tried
+                    continue
+                    
+                try:
+                    print(f"[LP_AGENT] Trying alternative offset: {alt_offset}...")
             rpc_payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -175,8 +365,8 @@ class MeteoraLPAgent:
                         "filters": [
                             {
                                 "memcmp": {
-                                    "offset": 8,  # Position owner offset
-                                    "bytes": wallet
+                                            "offset": alt_offset,
+                                            "bytes": wallet_base58
                                 }
                             }
                         ]
@@ -191,19 +381,157 @@ class MeteoraLPAgent:
             ) as response:
                 if response.status == 200:
                     result = await response.json()
-                    if "result" in result:
+                            
+                            if "error" in result:
+                                continue  # Try next offset
+                            
+                            if "result" in result and result["result"]:
                         positions = []
                         for account in result["result"]:
-                            # Parse position data
-                            positions.append({
+                                    account_info = account.get('account', {})
+                                    
+                                    # Verify owner matches
+                                    owner = account_info.get('owner')
+                                    if owner and owner.lower() == wallet.lower():
+                                        position_data = {
                                 'position_address': account.get('pubkey'),
-                                'data': account.get('account', {}).get('data', {}),
-                            })
+                                            'lamports': account_info.get('lamports', 0),
+                                            'owner': owner,
+                                        }
+                                        
+                                        parsed_data = account_info.get('data', {})
+                                        if isinstance(parsed_data, dict):
+                                            parsed_info = parsed_data.get('parsed', {})
+                                            if parsed_info:
+                                                position_data['parsed'] = parsed_info
+                                        
+                                        positions.append(position_data)
+                                
+                                if positions:
+                                    print(f"[LP_AGENT] ✅ Found {len(positions)} position(s) via offset {alt_offset}")
                         return positions
+                        else:
+                            if response.status == 429:
+                                print(f"[LP_AGENT] ⚠️ Rate limited, skipping offset {alt_offset}")
+                            continue  # Try next offset
+                except Exception:
+                    continue  # Try next offset
                 
+            # Method 4: Last resort - query without filter and check owner in response
+            # This is less efficient but more reliable if memcmp filters don't work
+            print(f"[LP_AGENT] Trying last resort: query all positions and filter by owner...")
+            print(f"[LP_AGENT] ⚠️ This may take longer if there are many positions")
+            
+            try:
+                # Query with dataSlice to limit response size
+                rpc_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getProgramAccounts",
+                    "params": [
+                        METEORA_DLMM_PROGRAM_ID,
+                        {
+                            "encoding": "jsonParsed",
+                            "dataSlice": {
+                                "offset": 0,
+                                "length": 100  # Just get first 100 bytes to check owner
+                            }
+                        }
+                    ]
+                }
+                
+                async with session.post(
+                    RPC_URL,
+                    json=rpc_payload,
+                    timeout=aiohttp.ClientTimeout(total=60)  # Longer timeout
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        
+                        if "error" in result:
+                            error_msg = result.get('error', {})
+                            if isinstance(error_msg, dict):
+                                error_code = error_msg.get('code')
+                                if error_code == -32009:  # Too large
+                                    print(f"[LP_AGENT] ⚠️ Too many positions to query without filter")
+                                    print(f"[LP_AGENT] 💡 Try using memcmp filter with correct offset")
+                                elif error_code == -32012:  # Scan aborted
+                                    print(f"[LP_AGENT] ⚠️ Query limit exceeded (too many positions)")
+                                    print(f"[LP_AGENT] 💡 This means there are many positions, but filter didn't match")
+                                else:
+                                    print(f"[LP_AGENT] Error querying all positions: {error_msg}")
+                            else:
+                                print(f"[LP_AGENT] Error: {error_msg}")
+                        elif "result" in result and result["result"]:
+                            total_accounts = len(result["result"])
+                            print(f"[LP_AGENT] Found {total_accounts} total position accounts, filtering by owner...")
+                            
+                            positions = []
+                            for account in result["result"]:
+                                account_info = account.get('account', {})
+                                owner = account_info.get('owner')
+                                
+                                # Check if owner matches
+                                if owner and owner.lower() == wallet.lower():
+                                    # Re-query this specific account for full data
+                                    position_data = {
+                                        'position_address': account.get('pubkey'),
+                                        'lamports': account_info.get('lamports', 0),
+                                        'owner': owner,
+                                    }
+                                    
+                                    # Try to get full parsed data
+                                    full_account_rpc = {
+                                        "jsonrpc": "2.0",
+                                        "id": 1,
+                                        "method": "getAccountInfo",
+                                        "params": [
+                                            account.get('pubkey'),
+                                            {"encoding": "jsonParsed"}
+                                        ]
+                                    }
+                                    
+                                    try:
+                                        async with session.post(
+                                            RPC_URL,
+                                            json=full_account_rpc,
+                                            timeout=aiohttp.ClientTimeout(total=10)
+                                        ) as full_response:
+                                            if full_response.status == 200:
+                                                full_result = await full_response.json()
+                                                if "result" in full_result and full_result["result"]:
+                                                    full_account = full_result["result"].get("value", {})
+                                                    parsed_data = full_account.get('data', {})
+                                                    if isinstance(parsed_data, dict):
+                                                        parsed_info = parsed_data.get('parsed', {})
+                                                        if parsed_info:
+                                                            position_data['parsed'] = parsed_info
+                                    except:
+                                        pass  # Continue without full data
+                                    
+                                    positions.append(position_data)
+                            
+                            if positions:
+                                print(f"[LP_AGENT] ✅ Found {len(positions)} position(s) via last resort method")
+                                return positions
+                            else:
+                                print(f"[LP_AGENT] ⚠️ Checked {total_accounts} accounts, none belong to wallet {wallet[:8]}...")
+            except Exception as last_resort_error:
+                print(f"[LP_AGENT] Last resort method failed: {last_resort_error}")
+            
+            # All methods failed
+            print(f"[LP_AGENT] ⚠️ All query methods failed. No positions found for wallet: {wallet}")
+            print(f"[LP_AGENT] 💡 Tips:")
+            print(f"   - Verify wallet has LP positions on Meteora UI or Solana Explorer")
+            print(f"   - Check RPC endpoint: {RPC_URL[:50]}..." if len(RPC_URL) > 50 else f"   - Check RPC endpoint: {RPC_URL}")
+            print(f"   - Solana Explorer: https://solscan.io/account/{wallet}")
+            print(f"   - If positions exist but not found, offset might be wrong")
+            print(f"   - Try using Meteora SDK for more reliable queries")
                 return []
         except Exception as e:
             print(f"[LP_AGENT] Error fetching LP positions: {e}")
+            import traceback
+            traceback.print_exc()
             return []
     
     def _calculate_bin_id_from_price(self, price: float, bin_step: int) -> int:
