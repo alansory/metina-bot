@@ -2250,6 +2250,21 @@ def _futardio_amount_usd(value) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
+def _futardio_embed_links(launch: Dict, include_website: bool = True) -> str:
+    """Build Link field: Futardio launch page, GMGN, Jupiter. Optionally website."""
+    launch_addr = (launch.get("launch_addr") or "").strip()
+    base_mint = (launch.get("base_mint_acct") or "").strip()
+    website = ((launch.get("launch_detail") or {}).get("website_url") or "").strip()
+    parts = []
+    if launch_addr:
+        parts.append(f"[Futardio](https://www.futard.io/launch/{launch_addr})")
+    if base_mint:
+        parts.append(f"[GMGN](https://gmgn.ai/sol/token/{base_mint})")
+        parts.append(f"[Jupiter](https://jup.ag/swap/SOL-{base_mint})")
+    if include_website and website:
+        parts.append(f"[Website]({website})")
+    return " · ".join(parts) if parts else "—"
+
 async def _send_futardio_new_ico_embed(channel: discord.TextChannel, launch: Dict):
     """Kirim embed notifikasi ICO baru (Futardio/MetaDAO v0_7)."""
     detail = launch.get("launch_detail") or {}
@@ -2264,7 +2279,7 @@ async def _send_futardio_new_ico_embed(channel: discord.TextChannel, launch: Dic
     sub_desc = (detail.get("sub_description") or "")[:200]
     creator = detail.get("creator_name") or ""
     launch_addr = launch.get("launch_addr") or ""
-    raise_link = f"https://metadao.fi/projects" if not website else website
+    links_text = _futardio_embed_links(launch, include_website=True)
     embed = discord.Embed(
         title=f"🆕 ICO Baru Futardio/MetaDAO: {title_name}",
         description=sub_desc or f"Raise **{title_name}** ({symbol}) sedang Live.",
@@ -2279,7 +2294,7 @@ async def _send_futardio_new_ico_embed(channel: discord.TextChannel, launch: Dic
     target_str = f"${target:,.0f}" if target is not None else "N/A"
     embed.add_field(name="Raised", value=committed_str, inline=True)
     embed.add_field(name="Target", value=target_str, inline=True)
-    embed.add_field(name="Link", value=f"[Open Raise / Site]({raise_link})", inline=False)
+    embed.add_field(name="Link", value=links_text, inline=False)
     if image_url:
         embed.set_thumbnail(url=image_url)
     embed.set_footer(text=f"Futardio/MetaDAO | {launch_addr[:8]}...")
@@ -2325,11 +2340,10 @@ async def _send_futardio_top_funded_embed(channel: discord.TextChannel, launch: 
     symbol = (token_info.get("symbol") or "?").strip()
     committed = _futardio_amount_usd(launch.get("total_committed_amount"))
     target = _futardio_amount_usd(launch.get("minimum_raise_amount"))
-    website = (detail.get("website_url") or "").strip()
     image_url = (detail.get("image_url") or "").strip()
     sub_desc = (detail.get("sub_description") or "")[:200]
     creator = detail.get("creator_name") or ""
-    raise_link = website or "https://metadao.fi/projects"
+    links_text = _futardio_embed_links(launch, include_website=True)
     closes_text = _format_raise_closes(launch)
     committed_str = f"${committed:,.0f}" if committed is not None else "N/A"
     target_str = f"${target:,.0f}" if target is not None else "N/A"
@@ -2345,7 +2359,7 @@ async def _send_futardio_top_funded_embed(channel: discord.TextChannel, launch: 
     embed.add_field(name="Raised", value=committed_str, inline=True)
     embed.add_field(name="Target", value=target_str, inline=True)
     embed.add_field(name="⏱️ Raise closes", value=closes_text, inline=False)
-    embed.add_field(name="Link", value=f"[Open Raise / Site]({raise_link})", inline=False)
+    embed.add_field(name="Link", value=links_text, inline=False)
     if image_url:
         embed.set_thumbnail(url=image_url)
     embed.set_footer(text="Futardio/MetaDAO | hourly top funded")
