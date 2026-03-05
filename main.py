@@ -101,6 +101,7 @@ ico_tracker_list: Dict[str, Dict] = {}
 FUTARDIO_LAUNCHES_API_URL = os.getenv("FUTARDIO_LAUNCHES_API_URL", "https://www.futard.io/api/graphql").strip()
 FUTARDIO_POLL_INTERVAL_MINUTES = int(os.getenv("FUTARDIO_POLL_INTERVAL", "10"))
 FUTARDIO_STATE_FILE = "futardio_ico_state.json"
+FUTARDIO_TOP_N_HOURLY = int(os.getenv("FUTARDIO_TOP_N_HOURLY", "3"))  # Kirim top N project (by committed) tiap jam
 futardio_known_launch_addrs: set = set()  # launch_addr yang sudah pernah dilihat (agar tidak double notif)
 
 async def wait_for_rate_limit():
@@ -2338,8 +2339,8 @@ def _format_raise_closes(launch: Dict) -> str:
     end_dt_wib = end_dt_utc.astimezone(WIB)
     return f"Raise closes in **{closes_in}** (jam **{end_dt_wib:%d %b %Y %H:%M} WIB**)"
 
-async def _send_futardio_top_funded_embed(channel: discord.TextChannel, launch: Dict):
-    """Kirim embed 1x: project dengan pendanaan terbanyak (Live), berdasarkan Raise closes."""
+async def _send_futardio_top_funded_embed(channel: discord.TextChannel, launch: Dict, rank: Optional[int] = None):
+    """Kirim embed: project dengan pendanaan terbanyak (Live), berdasarkan Raise closes. rank=1,2,3 untuk judul."""
     detail = launch.get("launch_detail") or {}
     token_info = launch.get("token") or {}
     title_name = detail.get("title") or "Unknown"
@@ -2353,8 +2354,9 @@ async def _send_futardio_top_funded_embed(channel: discord.TextChannel, launch: 
     closes_text = _format_raise_closes(launch)
     committed_str = f"${committed:,.0f}" if committed is not None else "N/A"
     target_str = f"${target:,.0f}" if target is not None else "N/A"
+    rank_str = f" #{rank}" if rank is not None else ""
     embed = discord.Embed(
-        title=f"🏆 Top funded (hourly): {title_name}",
+        title=f"🏆 Top funded{rank_str} (hourly): {title_name}",
         description=sub_desc or f"**{title_name}** ({symbol}) — pendanaan terbanyak saat ini.",
         color=0xFFD700,
         timestamp=datetime.now(timezone.utc),
@@ -2371,12 +2373,12 @@ async def _send_futardio_top_funded_embed(channel: discord.TextChannel, launch: 
         embed.add_field(name="Contract", value=f"`{base_mint}`", inline=False)
     if image_url:
         embed.set_thumbnail(url=image_url)
-    embed.set_footer(text="Futardio/MetaDAO | hourly top funded")
+    embed.set_footer(text=f"Futardio/MetaDAO | hourly top funded{rank_str}")
     await channel.send(embed=embed)
 
 @tasks.loop(hours=1)
 async def poll_futardio_top_funded_hourly():
-    """Setiap 1 jam: notif 1 project yang paling banyak difund (Live), berdasarkan Raise closes."""
+    """Setiap 1 jam: notif top N project yang paling banyak difund (Live), berdasarkan Raise closes."""
     if not FUTARDIO_LAUNCHES_API_URL:
         return
     channel_id = ICO_TRACKER_CHANNEL_ID or DAMM_CHANNEL_ID or BOT_CALL_CHANNEL_ID
@@ -2389,14 +2391,16 @@ async def poll_futardio_top_funded_hourly():
     live = [l for l in launches if (l.get("state") or "").strip() == "Live"]
     if not live:
         return
-    # Paling banyak difund = max total_committed_amount
-    top = max(live, key=lambda l: (l.get("total_committed_amount") or 0))
-    try:
-        await _send_futardio_top_funded_embed(channel, top)
-        title = (top.get("launch_detail") or {}).get("title") or "?"
-        print(f"[FUTARDIO_ICO] Hourly top funded: {title}")
-    except Exception as e:
-        print(f"[FUTARDIO_ICO] Error sending top-funded embed: {e}")
+    # Urutkan dari yang paling banyak difund, ambil top N
+    sorted_live = sorted(live, key=lambda l: (l.get("total_committed_amount") or 0), reverse=True)
+    top_n = sorted_live[: max(1, FUTARDIO_TOP_N_HOURLY)]
+    for i, launch in enumerate(top_n, start=1):
+        try:
+            await _send_futardio_top_funded_embed(channel, launch, rank=i)
+            title = (launch.get("launch_detail") or {}).get("title") or "?"
+            print(f"[FUTARDIO_ICO] Hourly top funded #{i}: {title}")
+        except Exception as e:
+            print(f"[FUTARDIO_ICO] Error sending top-funded embed #{i}: {e}")
 
 @poll_futardio_top_funded_hourly.before_loop
 async def before_poll_futardio_top_funded_hourly():
