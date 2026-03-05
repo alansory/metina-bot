@@ -2295,6 +2295,9 @@ async def _send_futardio_new_ico_embed(channel: discord.TextChannel, launch: Dic
     embed.add_field(name="Raised", value=committed_str, inline=True)
     embed.add_field(name="Target", value=target_str, inline=True)
     embed.add_field(name="Link", value=links_text, inline=False)
+    base_mint = (launch.get("base_mint_acct") or "").strip()
+    if base_mint:
+        embed.add_field(name="Contract", value=f"`{base_mint}`", inline=False)
     if image_url:
         embed.set_thumbnail(url=image_url)
     embed.set_footer(text=f"Futardio/MetaDAO | {launch_addr[:8]}...")
@@ -2313,8 +2316,10 @@ def _futardio_raise_closes_at(launch: Dict) -> Tuple[Optional[float], Optional[i
     except (TypeError, ValueError):
         return None, None
 
+WIB = timezone(timedelta(hours=7))
+
 def _format_raise_closes(launch: Dict) -> str:
-    """Format 'Raise closes in X' / 'Raise closes at Y'."""
+    """Format 'Raise closes in X' / 'Raise closes at Y' (waktu WIB)."""
     end_ts, secs = _futardio_raise_closes_at(launch)
     if end_ts is None or secs is None:
         return "Raise closes: N/A"
@@ -2329,8 +2334,9 @@ def _format_raise_closes(launch: Dict) -> str:
         closes_in = f"{hours}h {mins}m"
     else:
         closes_in = f"{mins} min"
-    end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
-    return f"Raise closes in **{closes_in}** (at {end_dt:%Y-%m-%d %H:%M} UTC)"
+    end_dt_utc = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    end_dt_wib = end_dt_utc.astimezone(WIB)
+    return f"Raise closes in **{closes_in}** (jam **{end_dt_wib:%d %b %Y %H:%M} WIB**)"
 
 async def _send_futardio_top_funded_embed(channel: discord.TextChannel, launch: Dict):
     """Kirim embed 1x: project dengan pendanaan terbanyak (Live), berdasarkan Raise closes."""
@@ -2360,6 +2366,9 @@ async def _send_futardio_top_funded_embed(channel: discord.TextChannel, launch: 
     embed.add_field(name="Target", value=target_str, inline=True)
     embed.add_field(name="⏱️ Raise closes", value=closes_text, inline=False)
     embed.add_field(name="Link", value=links_text, inline=False)
+    base_mint = (launch.get("base_mint_acct") or "").strip()
+    if base_mint:
+        embed.add_field(name="Contract", value=f"`{base_mint}`", inline=False)
     if image_url:
         embed.set_thumbnail(url=image_url)
     embed.set_footer(text="Futardio/MetaDAO | hourly top funded")
