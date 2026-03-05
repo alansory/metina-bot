@@ -95,6 +95,14 @@ ICO_TRACKER_CHANNEL_ID = int(os.getenv("ICO_TRACKER_CHANNEL_ID", str(DAMM_CHANNE
 # Format: {ico_id: {name, token_symbol, end_time, target, committed, url, daily_notified_dates, hour_reminder_sent, ...}}
 ico_tracker_list: Dict[str, Dict] = {}
 
+# --- FUTARDIO / METADAO NEW ICO NOTIFIER ---
+# Notifikasi ke Discord ketika ada ICO baru dari Futardio/MetaDAO (API v0_7_launches)
+# GraphQL endpoint; call dengan POST. Kosongkan untuk disable.
+FUTARDIO_LAUNCHES_API_URL = os.getenv("FUTARDIO_LAUNCHES_API_URL", "https://www.futard.io/api/graphql").strip()
+FUTARDIO_POLL_INTERVAL_MINUTES = int(os.getenv("FUTARDIO_POLL_INTERVAL", "10"))
+FUTARDIO_STATE_FILE = "futardio_ico_state.json"
+futardio_known_launch_addrs: set = set()  # launch_addr yang sudah pernah dilihat (agar tidak double notif)
+
 async def wait_for_rate_limit():
     """Wait if we're hitting rate limits, implements token bucket pattern."""
     global circuit_breaker_active, circuit_breaker_until, request_timestamps
@@ -340,6 +348,27 @@ def save_ico_tracker_state():
             json.dump(ico_tracker_list, f, indent=4)
     except Exception as e:
         print(f"[ERROR] Failed to save ICO tracker state: {e}")
+
+def load_futardio_ico_state():
+    """Load known Futardio/MetaDAO launch addresses (untuk deteksi ICO baru)."""
+    global futardio_known_launch_addrs
+    try:
+        if os.path.exists(FUTARDIO_STATE_FILE):
+            with open(FUTARDIO_STATE_FILE, "r") as f:
+                data = json.load(f)
+            futardio_known_launch_addrs = set(data.get("known_launch_addrs", []))
+            print(f"[FUTARDIO_ICO] Loaded {len(futardio_known_launch_addrs)} known launch(es)")
+    except Exception as e:
+        print(f"[ERROR] Failed to load Futardio ICO state: {e}")
+        futardio_known_launch_addrs = set()
+
+def save_futardio_ico_state():
+    """Save known Futardio launch addresses."""
+    try:
+        with open(FUTARDIO_STATE_FILE, "w") as f:
+            json.dump({"known_launch_addrs": list(futardio_known_launch_addrs)}, f, indent=2)
+    except Exception as e:
+        print(f"[ERROR] Failed to save Futardio ICO state: {e}")
 
 # Trading State
 TRADING_POSITIONS_FILE = "trading_positions.json"
@@ -2146,6 +2175,254 @@ async def _send_metadao_embed(channel: discord.TextChannel, launch: Dict[str, ob
     embed.add_field(name="MetaDAO", value=f"[Open Raise]({launch.get('buy_url')})", inline=False)
     await channel.send(embed=embed)
 
+# --- Futardio/MetaDAO NEW ICO notifier (GraphQL v0_7_launches) ---
+# Endpoint https://www.futard.io/api/graphql: read-only query biasanya tidak diproteksi auth;
+# yang perlu diperhatikan: rate limit (429). Poll 10 menit + User-Agent wajar aman.
+FUTARDIO_V07_LAUNCHES_QUERY = """
+query FutardioV07Launches {
+  v0_7_launches(
+    order_by: { created_at: desc }
+    limit: 100
+  ) {
+    launch_addr
+    base_mint_acct
+    total_committed_amount
+    minimum_raise_amount
+    state
+    unix_timestamp_started
+    seconds_for_launch
+    created_at
+    launch_detail {
+      title
+      sub_description
+      image_url
+      website_url
+      creator_name
+    }
+    token {
+      symbol
+      decimals
+    }
+  }
+}
+"""
+
+async def fetch_futardio_v07_launches() -> List[Dict]:
+    """Fetch v0_7_launches via Futardio GraphQL (POST). Returns list of launch dicts."""
+    if not FUTARDIO_LAUNCHES_API_URL:
+        return []
+    global http_session
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; MetinaBot/1.0)",
+    }
+    payload = {"query": FUTARDIO_V07_LAUNCHES_QUERY}
+    try:
+        async with http_session.post(
+            FUTARDIO_LAUNCHES_API_URL,
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=25),
+        ) as resp:
+            if resp.status == 429:
+                print("[FUTARDIO_ICO] Rate limited (429); skip this poll")
+                return []
+            resp.raise_for_status()
+            data = await resp.json()
+    except Exception as e:
+        print(f"[FUTARDIO_ICO] Fetch error: {e}")
+        return []
+    # GraphQL response: { "data": { "v0_7_launches": [ ... ] } }
+    inner = data.get("data") if isinstance(data, dict) else {}
+    if not isinstance(inner, dict):
+        return []
+    launches = inner.get("v0_7_launches") or []
+    return launches if isinstance(launches, list) else []
+
+def _futardio_amount_usd(value) -> Optional[float]:
+    """Convert micro-USDC (6 decimals) to USD for display."""
+    if value is None:
+        return None
+    try:
+        return float(value) / 1_000_000
+    except (TypeError, ValueError):
+        return None
+
+async def _send_futardio_new_ico_embed(channel: discord.TextChannel, launch: Dict):
+    """Kirim embed notifikasi ICO baru (Futardio/MetaDAO v0_7)."""
+    detail = launch.get("launch_detail") or {}
+    token_info = launch.get("token") or {}
+    title_name = detail.get("title") or "Unknown"
+    symbol = (token_info.get("symbol") or "?").strip()
+    committed = _futardio_amount_usd(launch.get("total_committed_amount"))
+    target = _futardio_amount_usd(launch.get("minimum_raise_amount"))
+    state = launch.get("state") or "Live"
+    website = (detail.get("website_url") or "").strip()
+    image_url = (detail.get("image_url") or "").strip()
+    sub_desc = (detail.get("sub_description") or "")[:200]
+    creator = detail.get("creator_name") or ""
+    launch_addr = launch.get("launch_addr") or ""
+    raise_link = f"https://metadao.fi/projects" if not website else website
+    embed = discord.Embed(
+        title=f"🆕 ICO Baru Futardio/MetaDAO: {title_name}",
+        description=sub_desc or f"Raise **{title_name}** ({symbol}) sedang Live.",
+        color=0x00AAFF,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Ticker", value=symbol, inline=True)
+    embed.add_field(name="State", value=state, inline=True)
+    if creator:
+        embed.add_field(name="Creator", value=creator, inline=True)
+    committed_str = f"${committed:,.0f}" if committed is not None else "N/A"
+    target_str = f"${target:,.0f}" if target is not None else "N/A"
+    embed.add_field(name="Raised", value=committed_str, inline=True)
+    embed.add_field(name="Target", value=target_str, inline=True)
+    embed.add_field(name="Link", value=f"[Open Raise / Site]({raise_link})", inline=False)
+    if image_url:
+        embed.set_thumbnail(url=image_url)
+    embed.set_footer(text=f"Futardio/MetaDAO | {launch_addr[:8]}...")
+    await channel.send(embed=embed)
+
+def _futardio_raise_closes_at(launch: Dict) -> Tuple[Optional[float], Optional[int]]:
+    """Return (end_ts, seconds_remaining). None if invalid."""
+    start = launch.get("unix_timestamp_started")
+    duration = launch.get("seconds_for_launch")
+    if start is None or duration is None:
+        return None, None
+    try:
+        end_ts = float(start) + float(duration)
+        now = time.time()
+        return end_ts, max(0, int(end_ts - now))
+    except (TypeError, ValueError):
+        return None, None
+
+def _format_raise_closes(launch: Dict) -> str:
+    """Format 'Raise closes in X' / 'Raise closes at Y'."""
+    end_ts, secs = _futardio_raise_closes_at(launch)
+    if end_ts is None or secs is None:
+        return "Raise closes: N/A"
+    if secs <= 0:
+        return "Raise **closed**"
+    days = secs // 86400
+    hours = (secs % 86400) // 3600
+    mins = (secs % 3600) // 60
+    if days > 0:
+        closes_in = f"{days}d {hours}h"
+    elif hours > 0:
+        closes_in = f"{hours}h {mins}m"
+    else:
+        closes_in = f"{mins} min"
+    end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    return f"Raise closes in **{closes_in}** (at {end_dt:%Y-%m-%d %H:%M} UTC)"
+
+async def _send_futardio_top_funded_embed(channel: discord.TextChannel, launch: Dict):
+    """Kirim embed 1x: project dengan pendanaan terbanyak (Live), berdasarkan Raise closes."""
+    detail = launch.get("launch_detail") or {}
+    token_info = launch.get("token") or {}
+    title_name = detail.get("title") or "Unknown"
+    symbol = (token_info.get("symbol") or "?").strip()
+    committed = _futardio_amount_usd(launch.get("total_committed_amount"))
+    target = _futardio_amount_usd(launch.get("minimum_raise_amount"))
+    website = (detail.get("website_url") or "").strip()
+    image_url = (detail.get("image_url") or "").strip()
+    sub_desc = (detail.get("sub_description") or "")[:200]
+    creator = detail.get("creator_name") or ""
+    raise_link = website or "https://metadao.fi/projects"
+    closes_text = _format_raise_closes(launch)
+    committed_str = f"${committed:,.0f}" if committed is not None else "N/A"
+    target_str = f"${target:,.0f}" if target is not None else "N/A"
+    embed = discord.Embed(
+        title=f"🏆 Top funded (hourly): {title_name}",
+        description=sub_desc or f"**{title_name}** ({symbol}) — pendanaan terbanyak saat ini.",
+        color=0xFFD700,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Ticker", value=symbol, inline=True)
+    if creator:
+        embed.add_field(name="Creator", value=creator, inline=True)
+    embed.add_field(name="Raised", value=committed_str, inline=True)
+    embed.add_field(name="Target", value=target_str, inline=True)
+    embed.add_field(name="⏱️ Raise closes", value=closes_text, inline=False)
+    embed.add_field(name="Link", value=f"[Open Raise / Site]({raise_link})", inline=False)
+    if image_url:
+        embed.set_thumbnail(url=image_url)
+    embed.set_footer(text="Futardio/MetaDAO | hourly top funded")
+    await channel.send(embed=embed)
+
+@tasks.loop(hours=1)
+async def poll_futardio_top_funded_hourly():
+    """Setiap 1 jam: notif 1 project yang paling banyak difund (Live), berdasarkan Raise closes."""
+    if not FUTARDIO_LAUNCHES_API_URL:
+        return
+    channel_id = ICO_TRACKER_CHANNEL_ID or DAMM_CHANNEL_ID or BOT_CALL_CHANNEL_ID
+    if not channel_id:
+        return
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
+    launches = await fetch_futardio_v07_launches()
+    live = [l for l in launches if (l.get("state") or "").strip() == "Live"]
+    if not live:
+        return
+    # Paling banyak difund = max total_committed_amount
+    top = max(live, key=lambda l: (l.get("total_committed_amount") or 0))
+    try:
+        await _send_futardio_top_funded_embed(channel, top)
+        title = (top.get("launch_detail") or {}).get("title") or "?"
+        print(f"[FUTARDIO_ICO] Hourly top funded: {title}")
+    except Exception as e:
+        print(f"[FUTARDIO_ICO] Error sending top-funded embed: {e}")
+
+@poll_futardio_top_funded_hourly.before_loop
+async def before_poll_futardio_top_funded_hourly():
+    await bot.wait_until_ready()
+
+@tasks.loop(minutes=FUTARDIO_POLL_INTERVAL_MINUTES)
+async def poll_futardio_new_icos():
+    """Poll Futardio/MetaDAO API; kirim notifikasi ke Discord untuk ICO baru (state Live)."""
+    global futardio_known_launch_addrs
+    if not FUTARDIO_LAUNCHES_API_URL:
+        return
+    channel_id = ICO_TRACKER_CHANNEL_ID or DAMM_CHANNEL_ID or BOT_CALL_CHANNEL_ID
+    if not channel_id:
+        return
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
+    launches = await fetch_futardio_v07_launches()
+    if not launches:
+        return
+    current_addrs = {str(l.get("launch_addr")) for l in launches if l.get("launch_addr")}
+    if not current_addrs:
+        return
+    # First run: seed known set without notifying
+    if not futardio_known_launch_addrs:
+        futardio_known_launch_addrs = set(current_addrs)
+        save_futardio_ico_state()
+        print(f"[FUTARDIO_ICO] Seeded {len(futardio_known_launch_addrs)} known launch(es)")
+        return
+    new_addrs = current_addrs - futardio_known_launch_addrs
+    for launch in launches:
+        addr = launch.get("launch_addr")
+        if not addr or addr not in new_addrs:
+            continue
+        if (launch.get("state") or "").strip() != "Live":
+            continue
+        try:
+            await _send_futardio_new_ico_embed(channel, launch)
+            print(f"[FUTARDIO_ICO] Notified new ICO: {launch.get('launch_detail', {}).get('title')} ({addr[:8]}...)")
+        except Exception as e:
+            print(f"[FUTARDIO_ICO] Error sending embed: {e}")
+    futardio_known_launch_addrs |= current_addrs
+    save_futardio_ico_state()
+
+@poll_futardio_new_icos.before_loop
+async def before_poll_futardio_new_icos():
+    await bot.wait_until_ready()
+    load_futardio_ico_state()
+
 @tasks.loop(minutes=1)  # Check setiap 1 menit
 async def auto_archive_threads():
     """Auto-archive thread setelah 15 menit dibuat"""
@@ -3896,6 +4173,16 @@ async def on_ready():
         poll_metadao_launches.start()
         print("[DEBUG] MetaDAO polling started")
     
+    if FUTARDIO_LAUNCHES_API_URL:
+        if not poll_futardio_new_icos.is_running():
+            poll_futardio_new_icos.start()
+            print(f"[FUTARDIO_ICO] New ICO notifier started (poll every {FUTARDIO_POLL_INTERVAL_MINUTES} min)")
+        if not poll_futardio_top_funded_hourly.is_running():
+            poll_futardio_top_funded_hourly.start()
+            print("[FUTARDIO_ICO] Top-funded hourly notifier started (every 1 hour)")
+    else:
+        print("[FUTARDIO_ICO] DISABLED - set FUTARDIO_LAUNCHES_API_URL to enable new ICO notifications")
+    
     # Start bot call polling task if channel ID is set
     if BOT_CALL_CHANNEL_ID:
         if not poll_new_tokens.is_running():
@@ -4997,6 +5284,60 @@ async def botcall_test(interaction: discord.Interaction):
             await interaction.followup.send(f"❌ {message}", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="futardio_test", description="Test Futardio/MetaDAO: fetch launches & kirim embed top-funded ke channel")
+async def futardio_test(interaction: discord.Interaction):
+    """Test apakah fetch GraphQL + embed Futardio berhasil."""
+    await interaction.response.defer(ephemeral=True)
+    if not FUTARDIO_LAUNCHES_API_URL:
+        await interaction.followup.send(
+            "❌ `FUTARDIO_LAUNCHES_API_URL` belum di-set. Set env dulu lalu restart bot.",
+            ephemeral=True,
+        )
+        return
+    channel_id = ICO_TRACKER_CHANNEL_ID or DAMM_CHANNEL_ID or BOT_CALL_CHANNEL_ID
+    if not channel_id:
+        await interaction.followup.send(
+            "❌ Tidak ada channel untuk notif (ICO_TRACKER_CHANNEL_ID / DAMM_CHANNEL_ID / BOT_CALL_CHANNEL_ID).",
+            ephemeral=True,
+        )
+        return
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        await interaction.followup.send(f"❌ Channel ID `{channel_id}` tidak ditemukan.", ephemeral=True)
+        return
+    try:
+        launches = await fetch_futardio_v07_launches()
+    except Exception as e:
+        await interaction.followup.send(f"❌ Fetch error: {e}", ephemeral=True)
+        return
+    if not launches:
+        await interaction.followup.send(
+            "⚠️ API mengembalikan 0 launches (mungkin rate limit / endpoint berubah). Coba lagi nanti.",
+            ephemeral=True,
+        )
+        return
+    live = [l for l in launches if (l.get("state") or "").strip() == "Live"]
+    if not live:
+        await interaction.followup.send(
+            f"✅ Fetch OK: {len(launches)} launch(es), tapi tidak ada yang **Live**. Embed tidak dikirim.",
+            ephemeral=True,
+        )
+        return
+    top = max(live, key=lambda l: (l.get("total_committed_amount") or 0))
+    try:
+        await _send_futardio_top_funded_embed(channel, top)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Gagal kirim embed: {e}", ephemeral=True)
+        return
+    title = (top.get("launch_detail") or {}).get("title") or "?"
+    await interaction.followup.send(
+        f"✅ **Test berhasil.**\n"
+        f"• Fetch: {len(launches)} launches, {len(live)} Live\n"
+        f"• Top funded: **{title}**\n"
+        f"• Embed dikirim ke {channel.mention}",
+        ephemeral=True,
+    )
 
 # ============================================================================
 # --- TRADING BOT SLASH COMMANDS ---
