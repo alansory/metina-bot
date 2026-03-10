@@ -2376,7 +2376,7 @@ async def _send_futardio_top_funded_embed(channel: discord.TextChannel, launch: 
     embed.set_footer(text=f"Futardio/MetaDAO | hourly top funded{rank_str}")
     await channel.send(embed=embed)
 
-@tasks.loop(hours=1)
+@tasks.loop(hours=3)
 async def poll_futardio_top_funded_hourly():
     """Setiap 1 jam: notif top N project yang paling banyak difund (Live), berdasarkan Raise closes."""
     if not FUTARDIO_LAUNCHES_API_URL:
