@@ -29,6 +29,14 @@ if not HELIUS_API_KEY:
     print("⚠️ HELIUS_API_KEY not set - Wallet tracking will be disabled!")
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
+# Meteora public Data API (replaces deprecated https://dlmm-api.meteora.ag/pair/* — returns 404)
+METEORA_DLMM_DATAPI = os.getenv("METEORA_DLMM_DATAPI", "https://dlmm.datapi.meteora.ag").strip().rstrip("/")
+METEORA_DAMM_V2_DATAPI = os.getenv("METEORA_DAMM_V2_DATAPI", "https://damm-v2.datapi.meteora.ag").strip().rstrip("/")
+
+# Token safety: Metina (Rugcheck) — optional hosted JSON API; else Rugcheck directly
+METINA_PUBLIC_URL = os.getenv("METINA_PUBLIC_URL", "https://metina.id").strip().rstrip("/")
+METINA_TOKEN_SAFETY_API = os.getenv("METINA_TOKEN_SAFETY_API", "").strip()
+
 # --- DISCORD INTENTS ---
 intents = discord.Intents.default()
 intents.message_content = True  # PENTING: untuk baca message content
@@ -481,21 +489,137 @@ async def get_token_price(token_address: str) -> Optional[float]:
     
     return None
 
+def _split_rugcheck_risks(risks: Optional[List]) -> Tuple[List[str], List[str], List[str]]:
+    critical_risks: List[str] = []
+    warnings: List[str] = []
+    rugcheck_risks: List[str] = []
+    for r in risks or []:
+        if isinstance(r, dict):
+            line = r.get("description") or r.get("name") or str(r)
+            rugcheck_risks.append(str(line))
+            lv = str(r.get("level") or "").lower()
+            if lv in ("danger", "critical"):
+                critical_risks.append(str(line))
+            elif lv in ("warn", "warning"):
+                warnings.append(str(line))
+        else:
+            s = str(r)
+            rugcheck_risks.append(s)
+    return critical_risks, warnings, rugcheck_risks
+
+def _rugcheck_score_to_embed_level(score: float) -> str:
+    s = float(score) if score is not None else 0.0
+    if s <= 25:
+        return "OK"
+    if s <= 800:
+        return "RISKY"
+    return "CRITICAL"
+
+def _build_metina_token_safety_from_rugcheck(data: Dict, mint: str) -> Dict:
+    """Shape compatible with Metina /api/metina/token-safety (Rugcheck-backed)."""
+    score = float(data.get("score") or 0)
+    top_holders = data.get("topHolders") or []
+    th = top_holders[0] if top_holders else None
+    top10_pct = sum(float(h.get("pct") or 0) for h in top_holders[:10])
+    insiders = [h for h in top_holders if h.get("insider")]
+    insider_pct = sum(float(h.get("pct") or 0) for h in insiders)
+
+    token_meta = data.get("tokenMeta") or {}
+    file_meta = data.get("fileMeta") or {}
+    token = data.get("token") or {}
+    critical_risks, warnings, rugcheck_risks = _split_rugcheck_risks(data.get("risks"))
+
+    mint_key = data.get("mint") or mint
+    markets = data.get("markets") or []
+
+    def _platform() -> str:
+        m = markets[0] if markets else None
+        t = str((m or {}).get("marketType") or "")
+        low = t.lower()
+        if "pump" in low:
+            return "pump.fun"
+        if "raydium" in low:
+            return "Raydium"
+        if "meteora" in low:
+            return "Meteora"
+        if "orca" in low:
+            return "Orca"
+        if isinstance(mint_key, str) and mint_key.lower().endswith("pump"):
+            return "pump.fun"
+        return t.replace("_", " ") if t else "Solana"
+
+    platform = _platform()
+    token_name = token_meta.get("name") or file_meta.get("name") or "Unknown"
+    token_symbol = token_meta.get("symbol") or file_meta.get("symbol") or ""
+
+    mint_auth = token.get("mintAuthority") or data.get("mintAuthority")
+    freeze_auth = token.get("freezeAuthority") or data.get("freezeAuthority")
+    meta_mut = token_meta.get("mutable")
+
+    liquidity_analysis = (
+        f"Liquidity: {len(markets)} market(s) detected ({platform})."
+        if markets
+        else "Liquidity data not indexed by Rugcheck for this token yet."
+    )
+    if not mint_auth and not freeze_auth and meta_mut is False:
+        props_analysis = (
+            "Token is fixed supply: mint & freeze authorities unset; metadata immutable."
+        )
+    else:
+        props_analysis = " ".join(
+            [
+                "Mint authority still set." if mint_auth else "Mint authority revoked.",
+                "Freeze authority set." if freeze_auth else "Freeze authority revoked.",
+                "Metadata mutable." if meta_mut else "Metadata immutable.",
+            ]
+        )
+
+    return {
+        "_source": "metina",
+        "mint": mint_key,
+        "overallSafetyLevel": _rugcheck_score_to_embed_level(score),
+        "tokenName": token_name,
+        "tokenSymbol": token_symbol,
+        "platform": platform,
+        "rugcheckScore": int(round(score)),
+        "rugCheckRisks": rugcheck_risks,
+        "criticalRisks": critical_risks,
+        "warnings": warnings,
+        "isMintable": bool(mint_auth),
+        "isFreezable": bool(freeze_auth),
+        "isMetadataMutable": meta_mut is True,
+        "mintAuthority": mint_auth,
+        "topHolderOwnership": float(th.get("pct") or 0) if th else 0.0,
+        "topTenOwnership": float(top10_pct),
+        "topNetworkOwnership": float(insider_pct),
+        "liquidityAnalysis": liquidity_analysis,
+        "tokenPropertiesAnalysis": props_analysis,
+    }
+
 async def fetch_token_safety(token_address: str) -> Optional[Dict]:
-    """Fetch token safety data from deepnets.ai API."""
+    """Metina-compatible token safety: optional METINA_TOKEN_SAFETY_API, else Rugcheck (same as metina.id)."""
     global http_session
     if not http_session:
         http_session = aiohttp.ClientSession()
-    
+
     try:
-        url = f"https://api.deepnets.ai/api/token-safety/{token_address}"
-        async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data
-            else:
-                print(f"[TOKEN_SAFETY] API returned status {response.status}")
+        if METINA_TOKEN_SAFETY_API:
+            url = f"{METINA_TOKEN_SAFETY_API.rstrip('/')}?mint={token_address}"
+            async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as response:
+                if response.status == 200:
+                    return await response.json()
+                print(f"[TOKEN_SAFETY] Metina API returned status {response.status}")
                 return None
+
+        rc_url = f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report"
+        async with http_session.get(
+            rc_url, headers={"Accept": "application/json"}, timeout=aiohttp.ClientTimeout(total=20)
+        ) as response:
+            if response.status != 200:
+                print(f"[TOKEN_SAFETY] Rugcheck returned status {response.status}")
+                return None
+            data = await response.json()
+            return _build_metina_token_safety_from_rugcheck(data, token_address)
     except asyncio.TimeoutError:
         print(f"[TOKEN_SAFETY] Timeout fetching safety data for {token_address}")
         return None
@@ -507,11 +631,11 @@ def create_token_safety_embeds(safety_data: Dict, token_address: str = None) -> 
     """Create Discord embeds for token safety information."""
     embeds = []
     
-    # Determine safety level color
+    # Determine safety level color (Metina / Rugcheck levels)
     safety_level = safety_data.get("overallSafetyLevel", "UNKNOWN")
     if safety_level == "SAFE" or safety_level == "OK":
         color = 0x00ff00  # Green
-    elif safety_level == "RISKY":
+    elif safety_level in ("RISKY", "WARN", "DANGER"):
         color = 0xff9900  # Orange
     elif safety_level == "CRITICAL":
         color = 0xff0000  # Red
@@ -644,9 +768,10 @@ def create_token_safety_embeds(safety_data: Dict, token_address: str = None) -> 
             inline=False
         )
     
-    # Add links to Deepnets.ai and GMGN if token_address is provided
+    # Metina + Deepnets + GMGN
     if token_address:
         links_value = (
+            f"[Metina Token Safety]({METINA_PUBLIC_URL}/token-safety?mint={token_address})\n"
             f"[🔍 Deepnets.ai](https://deepnets.ai/token/{token_address})\n"
             f"[📊 GMGN](https://gmgn.ai/sol/token/{token_address})"
         )
@@ -2534,67 +2659,47 @@ async def poll_metadao_launches():
 
 # --- HELPER: FETCH VOLUME/FEES FROM METEORA ---
 def fetch_meteora_volume_and_fees(token_address: str) -> Tuple[Optional[float], Optional[float]]:
-    """Fetch volume and fees data from Meteora pools for a token address.
+    """Fetch volume and fees data from Meteora DLMM Data API for a token mint.
     Returns: (volume_24h_usd, fees_24h_usd)"""
     if not USE_METEORA_FOR_FEES:
         return None, None
     
     try:
-        # Meteora API endpoint untuk pools
-        url = 'https://dlmm-api.meteora.ag/pair/all_by_groups'
+        url = f"{METEORA_DLMM_DATAPI}/pools"
         params = {
-            'search_term': token_address,
-            'sort_key': 'tvl',
-            'order_by': 'desc',
-            'limit': 20  # Ambil lebih banyak pools untuk akumulasi
+            "query": token_address,
+            "page_size": 100,
+            "sort_by": "volume_24h:desc",
         }
-        
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=15)
         if response.status_code != 200:
             return None, None
-        
         data = response.json()
-        total_volume_24h = 0
-        total_fees_24h = 0
-        
-        # Extract volume and fees from pools
-        if isinstance(data, dict) and 'groups' in data:
-            for group in data.get('groups', []):
-                pools = group.get('pairs', [])
-                for pool in pools:
-                    try:
-                        # Meteora API provides volume and fees data
-                        volume_24h = (
-                            pool.get('trade_volume_24h') or 
-                            (pool.get('volume', {}).get('hour_24') if isinstance(pool.get('volume'), dict) else None) or
-                            pool.get('volume24h') or
-                            pool.get('volume_24h')
-                        )
-                        
-                        fees_24h = (
-                            pool.get('fees_24h') or
-                            (pool.get('fees', {}).get('hour_24') if isinstance(pool.get('fees'), dict) else None) or
-                            pool.get('fees24h') or
-                            pool.get('fees_24h')
-                        )
-                        
-                        if volume_24h:
-                            try:
-                                total_volume_24h += float(volume_24h)
-                            except (ValueError, TypeError):
-                                pass
-                        
-                        if fees_24h:
-                            try:
-                                total_fees_24h += float(fees_24h)
-                            except (ValueError, TypeError):
-                                pass
-                    except Exception:
-                        continue
-        
+        rows = data.get("data") or []
+        tl = token_address.lower()
+        total_volume_24h = 0.0
+        total_fees_24h = 0.0
+        for pool in rows:
+            tx = (pool.get("token_x") or {}).get("address", "").lower()
+            ty = (pool.get("token_y") or {}).get("address", "").lower()
+            if tl not in (tx, ty):
+                continue
+            vol = pool.get("volume") or {}
+            fees = pool.get("fees") or {}
+            v24 = vol.get("24h")
+            f24 = fees.get("24h")
+            if v24 is not None:
+                try:
+                    total_volume_24h += float(v24)
+                except (ValueError, TypeError):
+                    pass
+            if f24 is not None:
+                try:
+                    total_fees_24h += float(f24)
+                except (ValueError, TypeError):
+                    pass
         volume = total_volume_24h if total_volume_24h > 0 else None
         fees = total_fees_24h if total_fees_24h > 0 else None
-        
         return volume, fees
     except Exception as e:
         print(f"[DEBUG] Error fetching Meteora data for {token_address[:8]}...: {e}")
@@ -4315,14 +4420,11 @@ def is_valid_solana_address(addr: str):
 
 # --- HELPER: FETCH POOL DATA ---
 def fetch_meteora_pools(ca: str, max_retries: int = 3):
-    """Fetch Meteora pools with rate limiting and retry logic for 429 errors."""
+    """Fetch Meteora DLMM pools via Data API (dlmm.datapi.meteora.ag)."""
     global meteora_last_request_time, meteora_circuit_breaker_active, meteora_circuit_breaker_until
     
-    print(f"[DEBUG] Fetching Meteora pools for {ca} using all_by_groups API")
-    base_url = 'https://dlmm-api.meteora.ag/pair/all_by_groups'
-    
-    # OPTIMASI: Gunakan search_term untuk filter di server side, jauh lebih cepat!
-    # API akan filter pools yang mengandung contract address ini
+    print(f"[DEBUG] Fetching Meteora pools for {ca} using DLMM Data API ({METEORA_DLMM_DATAPI})")
+    base_url = f"{METEORA_DLMM_DATAPI}/pools"
     target_contract = ca
     
     # Check circuit breaker
@@ -4342,21 +4444,20 @@ def fetch_meteora_pools(ca: str, max_retries: int = 3):
             now = time.time()
     
     params = {
-        'search_term': target_contract,  # Filter by contract address
-        'sort_key': 'tvl',  # Sort by TVL untuk dapat pools teratas
-        'order_by': 'desc',  # Descending order (highest TVL first)
-        'limit': 50 # Ambil 50 pools teratas (cukup untuk sort & ambil top 10)
+        "query": target_contract,
+        "page_size": 100,
+        "sort_by": "tvl:desc",
     }
     
     # Retry logic with exponential backoff for 429 errors
     for attempt in range(max_retries):
         try:
             start_time = time.time()
-            print(f"[DEBUG] Using all_by_groups API: {base_url} (attempt {attempt + 1}/{max_retries})")
-            print(f"[DEBUG] Search term: {target_contract}")
+            print(f"[DEBUG] DLMM Data API: {base_url} (attempt {attempt + 1}/{max_retries})")
+            print(f"[DEBUG] Query: {target_contract}")
             sys.stdout.flush()
             
-            print(f"[DEBUG] Making request with search_term...")
+            print(f"[DEBUG] Making request...")
             sys.stdout.flush()
             
             response = requests.get(base_url, params=params, timeout=30)
@@ -4386,74 +4487,64 @@ def fetch_meteora_pools(ca: str, max_retries: int = 3):
             # Reset circuit breaker on success
             meteora_circuit_breaker_active = False
             
-            # Extract pools from groups structure
             matching_pools = []
-            if isinstance(data, dict) and 'groups' in data:
-                for group in data.get('groups', []):
-                    pools = group.get('pairs', [])
-                    for pool in pools:
+            target_lower = target_contract.lower()
+            pools_rows = []
+            if isinstance(data, dict):
+                pools_rows = data.get("data") or []
+            for pool in pools_rows:
+                try:
+                    tx = (pool.get("token_x") or {}).get("address", "").lower()
+                    ty = (pool.get("token_y") or {}).get("address", "").lower()
+                    if target_lower not in (tx, ty):
+                        continue
+                    name = (pool.get("name") or "").strip()
+                    if name:
+                        clean_name = name.replace(" DLMM", "").replace("DLMM", "").strip()
+                        separator = "/" if "/" in clean_name else "-"
+                        parts = clean_name.split(separator)
+                        if len(parts) >= 2:
+                            pair_name = f"{parts[0].strip()}-{parts[1].strip()}"
+                        else:
+                            pair_name = clean_name
+                    else:
+                        matching_mint = tx if target_lower == tx else ty
+                        pair_name = f"{matching_mint[:8]} Pair"
+
+                    liq = float(pool.get("tvl", 0) or 0)
+                    liq_str = f"${liq/1000:.1f}K" if liq >= 1000 else f"${liq:.1f}"
+                    pc = pool.get("pool_config") or {}
+                    bin_step = int(pc.get("bin_step", 0) or 0)
+                    base_fee_pct = pc.get("base_fee_pct")
+                    base_fee_val = None
+                    if base_fee_pct is not None:
                         try:
-                            mint_x = pool.get('mint_x', '').lower()
-                            mint_y = pool.get('mint_y', '').lower()
-                            target_lower = target_contract.lower()
-                            
-                            # Double check: pool harus match dengan contract address
-                            if target_lower in [mint_x, mint_y]:
-                                name = pool.get('name', '').strip()
-                                if name:
-                                    clean_name = name.replace(' DLMM', '').replace('DLMM', '').strip()
-                                    separator = '/' if '/' in clean_name else '-'
-                                    parts = clean_name.split(separator)
-                                    if len(parts) >= 2:
-                                        pair_name = f"{parts[0].strip()}-{parts[1].strip()}"
-                                    else:
-                                        pair_name = clean_name
-                                else:
-                                    matching_mint = mint_x if target_lower == mint_x else mint_y
-                                    pair_name = f"{matching_mint[:8]} Pair"
-
-                                liq = float(pool.get('liquidity', 0))
-                                liq_str = f"${liq/1000:.1f}K" if liq >= 1000 else f"${liq:.1f}"
-                                bin_step = pool.get('bin_step', 0)
-                                address = pool.get('address', '')
-                                
-                                # Get base fee from pool data (API returns percentage e.g. 0.2 = 0.2%, 5 = 5%)
-                                base_fee_val = None
-                                if 'base_fee_percentage' in pool:
-                                    base_fee_percentage = pool.get('base_fee_percentage')
-                                    try:
-                                        if isinstance(base_fee_percentage, (int, float)):
-                                            base_fee_val = float(base_fee_percentage)
-                                        elif isinstance(base_fee_percentage, str):
-                                            base_fee_val = float(base_fee_percentage)
-                                    except (ValueError, TypeError):
-                                        pass
-                                
-                                # Default to 5 only if base_fee not found (do NOT use 5 when value is 0.2 - int(0.2)=0 was wrongly triggering this)
-                                if base_fee_val is None:
-                                    base_fee_val = 5.0
-                                
-                                # Format for display: show as integer if whole number, else 1 decimal (e.g. 80/0.2 or 80/5)
-                                if base_fee_val == int(base_fee_val):
-                                    base_fee_str = str(int(base_fee_val))
-                                else:
-                                    base_fee_str = f"{base_fee_val:.1f}".rstrip('0').rstrip('.')
-                                bin_format = f"{bin_step}/{base_fee_str}"
-
-                                matching_pools.append({
-                                    'pair': pair_name,
-                                    'bin': bin_format,
-                                    'liq': liq_str,
-                                    'raw_liq': liq,
-                                    'address': address
-                                })
-                        except Exception as e:
-                            # Skip error pools, continue
-                            continue
+                            base_fee_val = float(base_fee_pct)
+                        except (ValueError, TypeError):
+                            pass
+                    if base_fee_val is None:
+                        base_fee_val = 5.0
+                    if base_fee_val == int(base_fee_val):
+                        base_fee_str = str(int(base_fee_val))
+                    else:
+                        base_fee_str = f"{base_fee_val:.1f}".rstrip("0").rstrip(".")
+                    bin_format = f"{bin_step}/{base_fee_str}"
+                    address = pool.get("address") or ""
+                    if not address:
+                        continue
+                    matching_pools.append({
+                        "pair": pair_name,
+                        "bin": bin_format,
+                        "liq": liq_str,
+                        "raw_liq": liq,
+                        "address": address,
+                    })
+                except Exception:
+                    continue
             
             total_time = time.time() - start_time
             print(f"[DEBUG] ✅ API request completed in {total_time:.2f} seconds!")
-            print(f"[DEBUG] ✅ Found {len(matching_pools)} matching pools (already filtered by API)")
+            print(f"[DEBUG] ✅ Found {len(matching_pools)} matching pool(s)")
             sys.stdout.flush()
             
             return matching_pools
@@ -4507,135 +4598,66 @@ def fetch_meteora_pools(ca: str, max_retries: int = 3):
 
 async def fetch_dammv2_pools(token_address: str) -> List[Dict]:
     """
-    Fetch DAMM v2 pools for a token from Meteora API.
-    Returns list of pools with their addresses.
+    Fetch DAMM v2 pools for a token from Meteora Data API; fallback to DLMM Data API.
     """
     global http_session
-    
+
     if not http_session:
         http_session = aiohttp.ClientSession()
-    
-    pools = []
-    
+
+    pools: List[Dict] = []
+    tl = token_address.lower()
+
+    def _append_from_datapi_row(pool: Dict, pool_type: str) -> None:
+        addr = pool.get("address")
+        if not addr:
+            return
+        tx = (pool.get("token_x") or {}).get("address", "").lower()
+        ty = (pool.get("token_y") or {}).get("address", "").lower()
+        if tl not in (tx, ty):
+            return
+        vol = pool.get("volume") or {}
+        fees = pool.get("fees") or {}
+        row = {
+            "address": addr,
+            "type": pool_type,
+            "token_a": (pool.get("token_x") or {}).get("address"),
+            "token_b": (pool.get("token_y") or {}).get("address"),
+            "liquidity": pool.get("tvl", 0),
+            "volume_24h": vol.get("24h", 0),
+            "fee": fees.get("24h", 0),
+            "created_at": pool.get("created_at"),
+        }
+        if pool_type == "dlmm":
+            pc = pool.get("pool_config") or {}
+            row["name"] = pool.get("name", "")
+            row["bin_step"] = pc.get("bin_step")
+            row["base_fee"] = pc.get("base_fee_pct")
+        pools.append(row)
+
     try:
-        # Try DAMM v2 API endpoint (Dynamic AMM v2)
-        # Meteora DAMM v2 API: https://amm-v2.meteora.ag/pools
-        dammv2_url = f"https://amm-v2.meteora.ag/pools?token={token_address}"
-        
-        async with http_session.get(dammv2_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+        damm_url = f"{METEORA_DAMM_V2_DATAPI}/pools"
+        params = {"query": token_address, "page_size": 50, "sort_by": "tvl:desc"}
+        async with http_session.get(damm_url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
             if response.status == 200:
                 data = await response.json()
-                
-                # Handle different response formats
-                if isinstance(data, list):
-                    for pool in data:
-                        pool_address = pool.get('pool_address') or pool.get('address') or pool.get('id')
-                        if pool_address:
-                            pools.append({
-                                "address": pool_address,
-                                "type": "dammv2",
-                                "token_a": pool.get('token_a_mint') or pool.get('tokenAMint'),
-                                "token_b": pool.get('token_b_mint') or pool.get('tokenBMint'),
-                                "liquidity": pool.get('liquidity') or pool.get('tvl', 0),
-                                "volume_24h": pool.get('volume_24h') or pool.get('trade_volume_24h', 0),
-                                "fee": pool.get('fee') or pool.get('fees_24h', 0),
-                                "created_at": pool.get('created_at') or pool.get('pool_created_at'),
-                            })
-                elif isinstance(data, dict):
-                    # Single pool or nested structure
-                    if 'pools' in data:
-                        for pool in data['pools']:
-                            pool_address = pool.get('pool_address') or pool.get('address') or pool.get('id')
-                            if pool_address:
-                                pools.append({
-                                    "address": pool_address,
-                                    "type": "dammv2",
-                                    "token_a": pool.get('token_a_mint') or pool.get('tokenAMint'),
-                                    "token_b": pool.get('token_b_mint') or pool.get('tokenBMint'),
-                                    "liquidity": pool.get('liquidity') or pool.get('tvl', 0),
-                                    "volume_24h": pool.get('volume_24h', 0),
-                                    "fee": pool.get('fee', 0),
-                                    "created_at": pool.get('created_at'),
-                                })
-                    elif 'pool_address' in data or 'address' in data:
-                        pool_address = data.get('pool_address') or data.get('address')
-                        pools.append({
-                            "address": pool_address,
-                            "type": "dammv2",
-                            "token_a": data.get('token_a_mint'),
-                            "token_b": data.get('token_b_mint'),
-                            "liquidity": data.get('liquidity', 0),
-                            "volume_24h": data.get('volume_24h', 0),
-                            "fee": data.get('fee', 0),
-                            "created_at": data.get('created_at'),
-                        })
-                
-                if pools:
-                    print(f"[DAMM_V2] Found {len(pools)} DAMM v2 pool(s) for {token_address[:8]}...")
-                    return pools
-        
-        # Fallback: Try alternative endpoint (pool search by mint)
-        search_url = f"https://amm-v2.meteora.ag/pair/all?search_term={token_address}"
-        
-        async with http_session.get(search_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
-            if response.status == 200:
-                data = await response.json()
-                if isinstance(data, list):
-                    for pool in data:
-                        mint_x = (pool.get('mint_x') or pool.get('token_a_mint') or '').lower()
-                        mint_y = (pool.get('mint_y') or pool.get('token_b_mint') or '').lower()
-                        target_lower = token_address.lower()
-                        
-                        if target_lower in [mint_x, mint_y]:
-                            pool_address = pool.get('address') or pool.get('pool_address')
-                            if pool_address:
-                                pools.append({
-                                    "address": pool_address,
-                                    "type": "dammv2",
-                                    "token_a": pool.get('mint_x') or pool.get('token_a_mint'),
-                                    "token_b": pool.get('mint_y') or pool.get('token_b_mint'),
-                                    "liquidity": pool.get('liquidity', 0),
-                                    "volume_24h": pool.get('trade_volume_24h', 0),
-                                    "fee": pool.get('fees_24h', 0),
-                                    "created_at": pool.get('created_at'),
-                                })
-                
-                if pools:
-                    print(f"[DAMM_V2] Found {len(pools)} pool(s) via search for {token_address[:8]}...")
-                    return pools
-        
-        # Try DLMM API as last resort (might redirect to DAMM v2)
-        dlmm_url = 'https://dlmm-api.meteora.ag/pair/all_by_groups'
-        params = {'search_term': token_address, 'limit': 10}
-        
+                for pool in data.get("data") or []:
+                    _append_from_datapi_row(pool, "dammv2")
+
+        if pools:
+            print(f"[DAMM_V2] Found {len(pools)} DAMM v2 pool(s) for {token_address[:8]}...")
+            return pools
+
+        dlmm_url = f"{METEORA_DLMM_DATAPI}/pools"
+        params = {"query": token_address, "page_size": 50, "sort_by": "tvl:desc"}
         async with http_session.get(dlmm_url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
             if response.status == 200:
                 data = await response.json()
-                if isinstance(data, dict) and 'groups' in data:
-                    for group in data.get('groups', []):
-                        for pool in group.get('pairs', []):
-                            mint_x = (pool.get('mint_x') or '').lower()
-                            mint_y = (pool.get('mint_y') or '').lower()
-                            target_lower = token_address.lower()
-                            
-                            if target_lower in [mint_x, mint_y]:
-                                pool_address = pool.get('address')
-                                if pool_address:
-                                    pools.append({
-                                        "address": pool_address,
-                                        "type": "dlmm",
-                                        "name": pool.get('name', ''),
-                                        "token_a": pool.get('mint_x'),
-                                        "token_b": pool.get('mint_y'),
-                                        "liquidity": pool.get('liquidity', 0),
-                                        "volume_24h": pool.get('trade_volume_24h', 0),
-                                        "fee": pool.get('fees_24h', 0),
-                                        "bin_step": pool.get('bin_step'),
-                                        "base_fee": pool.get('base_fee_percentage'),
-                                    })
-        
+                for pool in data.get("data") or []:
+                    _append_from_datapi_row(pool, "dlmm")
+
         return pools
-        
+
     except asyncio.TimeoutError:
         print(f"[DAMM_V2] Timeout fetching pools for {token_address[:8]}...")
         return []
