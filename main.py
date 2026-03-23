@@ -771,7 +771,7 @@ def create_token_safety_embeds(safety_data: Dict, token_address: str = None) -> 
     # Metina + Deepnets + GMGN
     if token_address:
         links_value = (
-            f"[Metina Token Safety]({METINA_PUBLIC_URL}/token-safety?mint={token_address})\n"
+            f"[🌐 Metina]({METINA_PUBLIC_URL}/token-safety?mint={token_address})\n"
             f"[🔍 Deepnets.ai](https://deepnets.ai/token/{token_address})\n"
             f"[📊 GMGN](https://gmgn.ai/sol/token/{token_address})"
         )
