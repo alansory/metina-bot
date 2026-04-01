@@ -2658,14 +2658,39 @@ async def poll_metadao_launches():
     save_metadao_state()
 
 # --- HELPER: FETCH VOLUME/FEES FROM METEORA ---
-def fetch_meteora_volume_and_fees(token_address: str) -> Tuple[Optional[float], Optional[float]]:
-    """Fetch volume and fees data from Meteora DLMM Data API for a token mint.
-    Returns: (volume_24h_usd, fees_24h_usd)"""
-    if not USE_METEORA_FOR_FEES:
-        return None, None
-    
+def _aggregate_meteora_datapi_pool_rows(rows: list, token_address: str) -> Tuple[float, float]:
+    """Sum volume_24h and fees_24h (USD) for pools that include this mint. Returns (vol, fees) raw sums."""
+    tl = token_address.lower()
+    total_volume_24h = 0.0
+    total_fees_24h = 0.0
+    for pool in rows or []:
+        if not isinstance(pool, dict):
+            continue
+        tx = (pool.get("token_x") or {}).get("address", "").lower()
+        ty = (pool.get("token_y") or {}).get("address", "").lower()
+        if tl not in (tx, ty):
+            continue
+        vol = pool.get("volume") or {}
+        fees = pool.get("fees") or {}
+        v24 = vol.get("24h")
+        f24 = fees.get("24h")
+        if v24 is not None:
+            try:
+                total_volume_24h += float(v24)
+            except (ValueError, TypeError):
+                pass
+        if f24 is not None:
+            try:
+                total_fees_24h += float(f24)
+            except (ValueError, TypeError):
+                pass
+    return total_volume_24h, total_fees_24h
+
+
+def _fetch_meteora_datapi_volume_fees_one_base(base_url: str, token_address: str) -> Tuple[float, float]:
+    """GET /pools from one Meteora Data API base (DLMM or DAMM v2). On failure returns (0, 0)."""
     try:
-        url = f"{METEORA_DLMM_DATAPI}/pools"
+        url = f"{base_url.rstrip('/')}/pools"
         params = {
             "query": token_address,
             "page_size": 100,
@@ -2673,37 +2698,30 @@ def fetch_meteora_volume_and_fees(token_address: str) -> Tuple[Optional[float], 
         }
         response = requests.get(url, params=params, timeout=15)
         if response.status_code != 200:
-            return None, None
+            return 0.0, 0.0
         data = response.json()
         rows = data.get("data") or []
-        tl = token_address.lower()
-        total_volume_24h = 0.0
-        total_fees_24h = 0.0
-        for pool in rows:
-            tx = (pool.get("token_x") or {}).get("address", "").lower()
-            ty = (pool.get("token_y") or {}).get("address", "").lower()
-            if tl not in (tx, ty):
-                continue
-            vol = pool.get("volume") or {}
-            fees = pool.get("fees") or {}
-            v24 = vol.get("24h")
-            f24 = fees.get("24h")
-            if v24 is not None:
-                try:
-                    total_volume_24h += float(v24)
-                except (ValueError, TypeError):
-                    pass
-            if f24 is not None:
-                try:
-                    total_fees_24h += float(f24)
-                except (ValueError, TypeError):
-                    pass
-        volume = total_volume_24h if total_volume_24h > 0 else None
-        fees = total_fees_24h if total_fees_24h > 0 else None
-        return volume, fees
+        return _aggregate_meteora_datapi_pool_rows(rows, token_address)
     except Exception as e:
-        print(f"[DEBUG] Error fetching Meteora data for {token_address[:8]}...: {e}")
+        print(f"[DEBUG] Meteora datapi ({base_url}) volume/fees error for {token_address[:8]}...: {e}")
+        return 0.0, 0.0
+
+
+def fetch_meteora_volume_and_fees(token_address: str) -> Tuple[Optional[float], Optional[float]]:
+    """Volume & fees 24h (USD): agregasi pool DLMM + DAMM v2 Data API untuk mint ini.
+    Returns: (volume_24h_usd, fees_24h_usd) — None jika total 0 / tidak ada data."""
+    if not USE_METEORA_FOR_FEES:
         return None, None
+
+    v_dlmm, f_dlmm = _fetch_meteora_datapi_volume_fees_one_base(METEORA_DLMM_DATAPI, token_address)
+    v_damm, f_damm = _fetch_meteora_datapi_volume_fees_one_base(METEORA_DAMM_V2_DATAPI, token_address)
+
+    total_vol = v_dlmm + v_damm
+    total_fees = f_dlmm + f_damm
+
+    volume = total_vol if total_vol > 0 else None
+    fees = total_fees if total_fees > 0 else None
+    return volume, fees
 
 # --- HELPER: FETCH SOL PRICE ---
 async def fetch_sol_price() -> float:
@@ -2763,6 +2781,70 @@ async def fetch_sol_price() -> float:
     
     print(f"[WARN] Could not fetch SOL price from any source, using default ${default_price}")
     return default_price
+
+_JUPITER_FEE_FIELD_KEYS = frozenset(["fees", "fees24h", "fees_24h", "totalFees", "total_fees"])
+
+
+def _parse_jupiter_fees_sol_from_dict(data: dict, token_symbol: str, source_label: str = "token") -> Optional[float]:
+    """Extract fee-in-SOL from Jupiter token payload (root + stats24h). Returns None if not found."""
+    if not isinstance(data, dict):
+        return None
+    stats24h = data.get("stats24h", {})
+    if not isinstance(stats24h, dict):
+        stats24h = {}
+    for fee_field in _JUPITER_FEE_FIELD_KEYS:
+        if fee_field in data:
+            try:
+                v = float(data[fee_field])
+                print(f"[DEBUG]   {token_symbol}: Found fees in {source_label}.{fee_field}: {v:.4f} SOL")
+                return v
+            except (ValueError, TypeError):
+                pass
+    for fee_field in _JUPITER_FEE_FIELD_KEYS:
+        if fee_field in stats24h:
+            try:
+                v = float(stats24h[fee_field])
+                print(f"[DEBUG]   {token_symbol}: Found fees in {source_label}.stats24h.{fee_field}: {v:.4f} SOL")
+                return v
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+async def _fetch_jupiter_token_fees_via_search(token_address: str, token_symbol: str) -> Optional[float]:
+    """tokens/v2/search by mint. Jika response tidak ada field fee → None (caller tetap pakai fee dari toptraded). Mint exact only."""
+    global http_session
+    if not http_session:
+        http_session = aiohttp.ClientSession()
+    url = "https://api.jup.ag/tokens/v2/search"
+    params = {"query": token_address}
+    headers = {"x-api-key": JUPITER_API_KEY}
+    try:
+        async with http_session.get(
+            url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
+        ) as response:
+            if response.status == 429:
+                print(f"[WARN] Jupiter search rate limited for {token_symbol}, skip fee refetch")
+                return None
+            if response.status != 200:
+                return None
+            data = await response.json()
+    except Exception as e:
+        print(f"[DEBUG] Jupiter search fee fetch failed for {token_symbol}: {e}")
+        return None
+    items = data if isinstance(data, list) else []
+    if not items and isinstance(data, dict):
+        items = data.get("data") or data.get("tokens") or []
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        tid = item.get("id") or item.get("address")
+        if tid == token_address:
+            return _parse_jupiter_fees_sol_from_dict(item, token_symbol, "search")
+    return None
+
 
 # --- HELPER: FETCH NEW TOKENS FROM JUPITER API ---
 async def fetch_new_tokens() -> List[Dict[str, object]]:
@@ -2890,58 +2972,66 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                             except (ValueError, TypeError):
                                 price_change_1h = None
                     
-                    # Get fees from Jupiter API response (fees are in SOL, not USD)
+                    # Fees: 2 pass — Jupiter (toptraded lalu search, search tanpa fee → tetap toptraded); Meteora DLMM+DAMM (retry tanpa fee → tetap fee Meteora lama); lalu 0.3% volume
+                    total_fees_sol = 0.0
+                    total_fees_usd = 0.0
+                    fee_origin = "calculated"
                     jupiter_fees_sol = None
-                    
-                    # Check for fees at token root level first (most common location based on API response)
-                    # Priority: "fees" (most common) -> "fees24h" -> "fees_24h" -> "totalFees" -> "total_fees"
-                    for fee_field in ["fees", "fees24h", "fees_24h", "totalFees", "total_fees"]:
-                        if fee_field in token:
-                            try:
-                                jupiter_fees_sol = float(token[fee_field])
-                                print(f"[DEBUG]   {token_symbol}: Found fees in token.{fee_field}: {jupiter_fees_sol:.4f} SOL")
-                                break
-                            except (ValueError, TypeError):
-                                pass
-                    
-                    # Fallback: Check for fees in stats24h if not found at root level
-                    if jupiter_fees_sol is None and stats24h and isinstance(stats24h, dict):
-                        for fee_field in ["fees", "fees24h", "fees_24h", "totalFees", "total_fees"]:
-                            if fee_field in stats24h:
-                                try:
-                                    jupiter_fees_sol = float(stats24h[fee_field])
-                                    print(f"[DEBUG]   {token_symbol}: Found fees in stats24h.{fee_field}: {jupiter_fees_sol:.4f} SOL")
-                                    break
-                                except (ValueError, TypeError):
-                                    pass
-                    
-                    # Try to get volume and fees from Meteora if enabled
-                    meteora_volume = None
                     meteora_fees = None
-                    if USE_METEORA_FOR_FEES:
-                        meteora_volume, meteora_fees = fetch_meteora_volume_and_fees(token_address)
-                    
-                    # Use Meteora volume if it's higher than Jupiter volume
-                    if meteora_volume and meteora_volume > (volume_24h_usd or 0):
-                        volume_24h_usd = meteora_volume
-                    
-                    # Calculate fees: prioritize Jupiter API fees (in SOL), then Meteora (in USD), then calculate from volume
-                    if jupiter_fees_sol and jupiter_fees_sol > 0:
-                        # Jupiter fees are already in SOL, use directly
-                        total_fees_sol = jupiter_fees_sol
-                        total_fees_usd = total_fees_sol * sol_price_usd if sol_price_usd and total_fees_sol > 0 else 0
-                        print(f"[DEBUG]   {token_symbol}: Using fees from Jupiter API: {total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)")
-                    elif meteora_fees and meteora_fees > 0:
-                        # Meteora fees are in USD, convert to SOL
-                        total_fees_usd = meteora_fees
-                        total_fees_sol = total_fees_usd / sol_price_usd if sol_price_usd and total_fees_usd > 0 else 0
-                        print(f"[DEBUG]   {token_symbol}: Using fees from Meteora: {total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)")
-                    else:
-                        # Calculate fees from volume (0.3% of volume is typical for DEX fees)
+
+                    for fee_pass in range(2):
+                        if fee_pass == 1:
+                            await asyncio.sleep(0.45)
+
+                        if fee_pass == 0:
+                            jupiter_fees_sol = _parse_jupiter_fees_sol_from_dict(token, token_symbol, "token")
+                        else:
+                            refetched = await _fetch_jupiter_token_fees_via_search(
+                                token_address, token_symbol
+                            )
+                            # Search tanpa fee di response → None: jangan timpa, tetap pakai toptraded
+                            if refetched is not None:
+                                jupiter_fees_sol = refetched
+
+                        meteora_volume = None
+                        if USE_METEORA_FOR_FEES:
+                            meteora_volume, meteora_fees_try = fetch_meteora_volume_and_fees(token_address)
+                            if meteora_fees_try is not None and meteora_fees_try > 0:
+                                meteora_fees = meteora_fees_try
+                            if meteora_volume and meteora_volume > (volume_24h_usd or 0):
+                                volume_24h_usd = meteora_volume
+
+                        if jupiter_fees_sol and jupiter_fees_sol > 0:
+                            total_fees_sol = jupiter_fees_sol
+                            total_fees_usd = (
+                                total_fees_sol * sol_price_usd if sol_price_usd and total_fees_sol > 0 else 0
+                            )
+                            fee_origin = "jupiter"
+                            print(
+                                f"[DEBUG]   {token_symbol}: Using fees from Jupiter API (pass {fee_pass + 1}/2): "
+                                f"{total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)"
+                            )
+                            break
+                        if meteora_fees and meteora_fees > 0:
+                            total_fees_usd = meteora_fees
+                            total_fees_sol = (
+                                total_fees_usd / sol_price_usd if sol_price_usd and total_fees_usd > 0 else 0
+                            )
+                            fee_origin = "meteora"
+                            print(
+                                f"[DEBUG]   {token_symbol}: Using fees from Meteora (pass {fee_pass + 1}/2): "
+                                f"{total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)"
+                            )
+                            break
+
+                    if fee_origin == "calculated":
                         fee_percentage = 0.003
                         total_fees_usd = volume_24h_usd * fee_percentage if volume_24h_usd else 0
                         total_fees_sol = total_fees_usd / sol_price_usd if sol_price_usd and total_fees_usd > 0 else 0
-                        print(f"[DEBUG]   {token_symbol}: Calculated fees from volume (0.3%): {total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)")
+                        print(
+                            f"[DEBUG]   {token_symbol}: Calculated fees from volume (0.3%) after 2 passes: "
+                            f"{total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)"
+                        )
                     
                     # Check criteria with detailed logging
                     market_cap_ok = market_cap and market_cap >= BOT_CALL_MIN_MARKET_CAP and market_cap <= BOT_CALL_MAX_MARKET_CAP
@@ -2953,8 +3043,14 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                     mcap_str = f"${market_cap:,.0f}" if market_cap else "$0"
                     print(f"    - Market cap: {mcap_str} (min: ${BOT_CALL_MIN_MARKET_CAP:,.0f}, max: ${BOT_CALL_MAX_MARKET_CAP:,.0f}) -> {'✅' if market_cap_ok else '❌'}")
                     
-                    # Show fees source
-                    fees_source = "Jupiter API" if jupiter_fees_sol and jupiter_fees_sol > 0 else ("Meteora" if meteora_fees and meteora_fees > 0 else "Calculated (0.3% of volume)")
+                    # Show fees source (aligned with 2-pass resolution + fallback)
+                    fees_source = (
+                        "Jupiter API"
+                        if fee_origin == "jupiter"
+                        else "Meteora"
+                        if fee_origin == "meteora"
+                        else "Calculated (0.3% of volume)"
+                    )
                     print(f"    - Fees: {total_fees_sol:.2f} SOL (${total_fees_usd:,.2f} USD) from {fees_source} (min: {BOT_CALL_MIN_FEES_SOL} SOL) -> {'✅' if fees_ok else '❌'}")
                     
                     price_change_str = f"{price_change_1h:.2f}%" if price_change_1h is not None else "N/A"
