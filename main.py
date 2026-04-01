@@ -2789,6 +2789,15 @@ def _parse_jupiter_fees_sol_from_dict(data: dict, token_symbol: str, source_labe
     """Extract fee-in-SOL from Jupiter token payload (root + stats24h). Returns None if not found."""
     if not isinstance(data, dict):
         return None
+    # Prioritize the most common/expected field: `fees` at the root token object.
+    # Some Jupiter endpoints include `fees` at root but omit it from stats objects.
+    if "fees" in data:
+        try:
+            v = float(data["fees"])
+            print(f"[DEBUG]   {token_symbol}: Found fees in {source_label}.fees: {v:.4f} SOL")
+            return v
+        except (ValueError, TypeError):
+            pass
     stats24h = data.get("stats24h", {})
     if not isinstance(stats24h, dict):
         stats24h = {}
