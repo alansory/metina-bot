@@ -791,6 +791,23 @@ def create_token_safety_embeds(safety_data: Dict, token_address: str = None) -> 
     
     return embeds
 
+
+def append_gmgn_fields_to_safety_embed(
+    embeds: List[discord.Embed],
+    fees_sol: Optional[float],
+    fees_usd: float,
+    fees_source: str,
+    x_url: Optional[str],
+) -> None:
+    """Add GMGN fee + X fields into first safety embed."""
+    if not embeds:
+        return
+    fees_usd_str = _format_usd(fees_usd) if fees_usd and fees_usd > 0 else "N/A"
+    fees_sol_str = f"{fees_sol:.2f} SOL" if fees_sol is not None and fees_sol > 0 else "N/A"
+    embeds[0].add_field(name="Total Fees (24h)", value=f"{fees_sol_str}\n({fees_usd_str})", inline=True)
+    embeds[0].add_field(name="Fees Source", value=fees_source or "GMGN unavailable", inline=True)
+    embeds[0].add_field(name="Twitter", value=f"[🐦 Twitter]({x_url})" if x_url else "N/A", inline=True)
+
 async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int = 300) -> Optional[Dict]:
     """Get swap quote from Jupiter API."""
     global http_session
@@ -3487,7 +3504,7 @@ async def send_bot_call_notification(token_data: Dict[str, object]):
             f"[📊 GMGN](https://gmgn.ai/sol/token/{token_address})"
         )
         if gmgn_x_url:
-            links_value += f"\n[𝕏 X]({gmgn_x_url})"
+            links_value += f"\n[🐦 Twitter]({gmgn_x_url})"
         
         # Add Meteora link with pool address if available, otherwise use search
         if meteora_pool_address:
@@ -7366,10 +7383,32 @@ async def on_message(message: discord.Message):
                 sys.stdout.flush()
                 
                 if not pools:
+                    gmgn_fees_sol = None
+                    gmgn_fees_usd = 0.0
+                    gmgn_fees_source = "GMGN unavailable"
+                    gmgn_x_url = None
+                    try:
+                        gmgn_fees_sol = await fetch_gmgn_token_fees_sol(content, content[:8])
+                        if gmgn_fees_sol is not None and gmgn_fees_sol > 0:
+                            gmgn_fees_source = "GMGN"
+                            sol_price_usd = await fetch_sol_price()
+                            gmgn_fees_usd = gmgn_fees_sol * sol_price_usd if sol_price_usd else 0.0
+                    except Exception as e:
+                        print(f"[DEBUG] Could not fetch GMGN fees for no-pool CA check: {e}")
+                    try:
+                        gmgn_x_url = await fetch_gmgn_token_x_url(content, content[:8])
+                    except Exception as e:
+                        print(f"[DEBUG] Could not fetch GMGN X link for no-pool CA check: {e}")
+
                     embed = discord.Embed(
                         title="Pool DLMM Meteora",
                         description=f"Gak ditemuin pool untuk token `{content[:8]}...`",
                         color=0xff0000)
+                    fees_usd_str = _format_usd(gmgn_fees_usd) if gmgn_fees_usd > 0 else "N/A"
+                    fees_sol_str = f"{gmgn_fees_sol:.2f} SOL" if gmgn_fees_sol and gmgn_fees_sol > 0 else "N/A"
+                    embed.add_field(name="Total Fees (24h)", value=f"{fees_sol_str}\n({fees_usd_str})", inline=True)
+                    embed.add_field(name="Fees Source", value=gmgn_fees_source, inline=True)
+                    embed.add_field(name="Twitter", value=f"[🐦 Twitter]({gmgn_x_url})" if gmgn_x_url else "N/A", inline=True)
                     await message.channel.send(embed=embed)
                     return
 
@@ -7385,7 +7424,7 @@ async def on_message(message: discord.Message):
                 # Optional GMGN enrich data for CA check embed
                 gmgn_fees_sol = None
                 gmgn_fees_usd = 0.0
-                gmgn_fees_source = "N/A"
+                gmgn_fees_source = "GMGN unavailable"
                 gmgn_x_url = None
                 try:
                     gmgn_fees_sol = await fetch_gmgn_token_fees_sol(content, content[:8])
@@ -7402,16 +7441,11 @@ async def on_message(message: discord.Message):
 
                 print(f"[DEBUG] Creating embed object...")
                 embed = discord.Embed(title="Meteora Pool Bot", description=desc, color=0x00ff00)
-                if gmgn_fees_sol is not None and gmgn_fees_sol > 0:
-                    fees_usd_str = _format_usd(gmgn_fees_usd) if gmgn_fees_usd > 0 else "N/A"
-                    embed.add_field(
-                        name="Total Fees (24h)",
-                        value=f"{gmgn_fees_sol:.2f} SOL\n({fees_usd_str})",
-                        inline=True,
-                    )
-                    embed.add_field(name="Fees Source", value=gmgn_fees_source, inline=True)
-                if gmgn_x_url:
-                    embed.add_field(name="𝕏 X", value=f"[Open X]({gmgn_x_url})", inline=True)
+                fees_usd_str = _format_usd(gmgn_fees_usd) if gmgn_fees_usd > 0 else "N/A"
+                fees_sol_str = f"{gmgn_fees_sol:.2f} SOL" if gmgn_fees_sol and gmgn_fees_sol > 0 else "N/A"
+                embed.add_field(name="Total Fees (24h)", value=f"{fees_sol_str}\n({fees_usd_str})", inline=True)
+                embed.add_field(name="Fees Source", value=gmgn_fees_source, inline=True)
+                embed.add_field(name="Twitter", value=f"[🐦 Twitter]({gmgn_x_url})" if gmgn_x_url else "N/A", inline=True)
                 embed.set_footer(text=f"Requested by {message.author.display_name}")
                 print(f"[DEBUG] Sending embed with {len(pools[:10])} pools to channel {message.channel.id}")
                 sys.stdout.flush()
@@ -7482,7 +7516,7 @@ async def on_message(message: discord.Message):
                                         f"[🔍 Solscan](https://solscan.io/token/{self.token_address})\n"
                                         f"[🪐 Jupiter](https://jup.ag/tokens/{self.token_address})\n"
                                         f"[📊 GMGN](https://gmgn.ai/sol/token/{self.token_address})"
-                                        + (f"\n[𝕏 X]({self.token_x_url})" if self.token_x_url else "")
+                                        + (f"\n[🐦 Twitter]({self.token_x_url})" if self.token_x_url else "")
                                     ),
                                     inline=False
                                 )
@@ -7552,6 +7586,13 @@ async def on_message(message: discord.Message):
                     safety_data = await fetch_token_safety(content)
                     if safety_data:
                         safety_embeds = create_token_safety_embeds(safety_data, content)
+                        append_gmgn_fields_to_safety_embed(
+                            safety_embeds,
+                            gmgn_fees_sol,
+                            gmgn_fees_usd,
+                            gmgn_fees_source,
+                            gmgn_x_url,
+                        )
                         for safety_embed in safety_embeds:
                             try:
                                 await message.channel.send(embed=safety_embed)
@@ -7849,6 +7890,29 @@ async def call_token(ctx: commands.Context, ca: str):
         safety_data = await fetch_token_safety(ca)
         if safety_data:
             safety_embeds = create_token_safety_embeds(safety_data, ca)
+            gmgn_fees_sol = None
+            gmgn_fees_usd = 0.0
+            gmgn_fees_source = "GMGN unavailable"
+            gmgn_x_url = None
+            try:
+                gmgn_fees_sol = await fetch_gmgn_token_fees_sol(ca, ca[:8])
+                if gmgn_fees_sol is not None and gmgn_fees_sol > 0:
+                    gmgn_fees_source = "GMGN"
+                    sol_price_usd = await fetch_sol_price()
+                    gmgn_fees_usd = gmgn_fees_sol * sol_price_usd if sol_price_usd else 0.0
+            except Exception as e:
+                print(f"[DEBUG] Could not fetch GMGN fees for !call safety embed: {e}")
+            try:
+                gmgn_x_url = await fetch_gmgn_token_x_url(ca, ca[:8])
+            except Exception as e:
+                print(f"[DEBUG] Could not fetch GMGN X link for !call safety embed: {e}")
+            append_gmgn_fields_to_safety_embed(
+                safety_embeds,
+                gmgn_fees_sol,
+                gmgn_fees_usd,
+                gmgn_fees_source,
+                gmgn_x_url,
+            )
             for safety_embed in safety_embeds:
                 try:
                     await thread.send(embed=safety_embed)
