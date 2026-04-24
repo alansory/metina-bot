@@ -13,8 +13,7 @@ cmds = [
     ". /app/venv/bin/activate && pip install --upgrade pip",
     ". /app/venv/bin/activate && pip install -r requirements.txt",
     "npm install",
-    "npm install -g gmgn-cli",
-    "gmgn-cli --version"
+    "npm install -g gmgn-cli || true"
 ]
 
 [phases.build]

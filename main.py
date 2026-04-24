@@ -2925,9 +2925,18 @@ def _extract_gmgn_pool_fee_ratio_percent(payload: dict) -> Optional[float]:
 
 async def _run_gmgn_cli_json(args: List[str], token_symbol: str, timeout_sec: int = 12) -> Optional[dict]:
     """Run gmgn-cli and parse JSON output safely. Returns None on any failure."""
+    cli_cmd: Optional[List[str]] = None
+    if shutil.which("gmgn-cli"):
+        cli_cmd = ["gmgn-cli"]
+    elif shutil.which("npx"):
+        # Container fallback when global npm bin path is not on PATH.
+        cli_cmd = ["npx", "-y", "gmgn-cli"]
+    else:
+        return None
+
     try:
         process = await asyncio.create_subprocess_exec(
-            "gmgn-cli",
+            *cli_cmd,
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -2963,7 +2972,7 @@ async def fetch_gmgn_volume_and_fees(token_address: str, token_symbol: str) -> T
     """Best-effort GMGN fallback: fees_usd = volume_24h_usd * (pool_fee_ratio_percent/100)."""
     if not USE_GMGN_FOR_FEES:
         return None, None
-    if not shutil.which("gmgn-cli"):
+    if not (shutil.which("gmgn-cli") or shutil.which("npx")):
         return None, None
 
     # `token pool` gives fee_ratio, while volume is fetched from kline route.
@@ -2995,7 +3004,7 @@ async def fetch_gmgn_token_fees_sol(token_address: str, token_symbol: str) -> Op
     """Prefer direct fee fields from GMGN token info payload (total_fee/trade_fee)."""
     if not USE_GMGN_FOR_FEES:
         return None
-    if not shutil.which("gmgn-cli"):
+    if not (shutil.which("gmgn-cli") or shutil.which("npx")):
         return None
 
     payload = await _run_gmgn_cli_json(
@@ -3033,7 +3042,7 @@ async def fetch_gmgn_token_x_url(token_address: str, token_symbol: str) -> Optio
     """Fetch token X/Twitter URL from GMGN token info response."""
     if not USE_GMGN_FOR_FEES:
         return None
-    if not shutil.which("gmgn-cli"):
+    if not (shutil.which("gmgn-cli") or shutil.which("npx")):
         return None
 
     payload = await _run_gmgn_cli_json(

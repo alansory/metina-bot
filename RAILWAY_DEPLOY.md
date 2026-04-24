@@ -41,10 +41,10 @@ Railway akan otomatis install Meteora SDK saat deploy jika konfigurasi berikut a
 4. **Auto-install `gmgn-cli` saat deploy:**
    - Sudah diset di `nixpacks.toml` phase `install`:
    ```toml
-   "npm install -g gmgn-cli",
-   "gmgn-cli --version"
+   "npm install -g gmgn-cli || true"
    ```
-   - Jadi setiap deploy baru, binary `gmgn-cli` akan tersedia otomatis di runtime image.
+   - Jadi setiap deploy baru, binary `gmgn-cli` akan diinstall tanpa bikin build fail saat PATH layer build berbeda.
+   - Verifikasi pakai log runtime bot (`[WARN] ... GMGN ... skip`) atau test manual setelah deploy.
 
 ### Verifikasi:
 
