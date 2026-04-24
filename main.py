@@ -799,14 +799,42 @@ def append_gmgn_fields_to_safety_embed(
     fees_source: str,
     x_url: Optional[str],
 ) -> None:
-    """Add GMGN fee + X fields into first safety embed."""
+    """Add GMGN fee + Twitter into RugCheck Score embed with ordered placement."""
     if not embeds:
         return
+    target_idx = 1 if len(embeds) > 1 else 0
+    target_embed = embeds[target_idx]
+    embed_dict = target_embed.to_dict()
+    fields = list(embed_dict.get("fields", []))
+
     fees_usd_str = _format_usd(fees_usd) if fees_usd and fees_usd > 0 else "N/A"
     fees_sol_str = f"{fees_sol:.2f} SOL" if fees_sol is not None and fees_sol > 0 else "N/A"
-    embeds[0].add_field(name="Total Fees (24h)", value=f"{fees_sol_str}\n({fees_usd_str})", inline=True)
-    embeds[0].add_field(name="Fees Source", value=fees_source or "GMGN unavailable", inline=True)
-    embeds[0].add_field(name="Twitter", value=f"[🐦 Twitter]({x_url})" if x_url else "N/A", inline=True)
+    fee_fields = [
+        {"name": "Total Fees (24h)", "value": f"{fees_sol_str}\n({fees_usd_str})", "inline": True},
+        {"name": "Fees Source", "value": fees_source or "GMGN unavailable", "inline": True},
+    ]
+
+    insert_at = len(fields)
+    for i, field in enumerate(fields):
+        if field.get("name") == "Holder Distribution":
+            insert_at = i + 1
+            break
+    fields[insert_at:insert_at] = fee_fields
+
+    # Add Twitter into existing Links field inside RugCheck embed.
+    for field in fields:
+        if field.get("name") == "🔗 Links":
+            if x_url:
+                twitter_line = f"[🐦 Twitter]({x_url})"
+                if twitter_line not in field.get("value", ""):
+                    field["value"] = f"{field.get('value', '')}\n{twitter_line}".strip()
+            else:
+                if "Twitter: N/A" not in field.get("value", ""):
+                    field["value"] = f"{field.get('value', '')}\nTwitter: N/A".strip()
+            break
+
+    embed_dict["fields"] = fields
+    embeds[target_idx] = discord.Embed.from_dict(embed_dict)
 
 async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int = 300) -> Optional[Dict]:
     """Get swap quote from Jupiter API."""
@@ -7404,11 +7432,6 @@ async def on_message(message: discord.Message):
                         title="Pool DLMM Meteora",
                         description=f"Gak ditemuin pool untuk token `{content[:8]}...`",
                         color=0xff0000)
-                    fees_usd_str = _format_usd(gmgn_fees_usd) if gmgn_fees_usd > 0 else "N/A"
-                    fees_sol_str = f"{gmgn_fees_sol:.2f} SOL" if gmgn_fees_sol and gmgn_fees_sol > 0 else "N/A"
-                    embed.add_field(name="Total Fees (24h)", value=f"{fees_sol_str}\n({fees_usd_str})", inline=True)
-                    embed.add_field(name="Fees Source", value=gmgn_fees_source, inline=True)
-                    embed.add_field(name="Twitter", value=f"[🐦 Twitter]({gmgn_x_url})" if gmgn_x_url else "N/A", inline=True)
                     await message.channel.send(embed=embed)
                     return
 
@@ -7441,11 +7464,6 @@ async def on_message(message: discord.Message):
 
                 print(f"[DEBUG] Creating embed object...")
                 embed = discord.Embed(title="Meteora Pool Bot", description=desc, color=0x00ff00)
-                fees_usd_str = _format_usd(gmgn_fees_usd) if gmgn_fees_usd > 0 else "N/A"
-                fees_sol_str = f"{gmgn_fees_sol:.2f} SOL" if gmgn_fees_sol and gmgn_fees_sol > 0 else "N/A"
-                embed.add_field(name="Total Fees (24h)", value=f"{fees_sol_str}\n({fees_usd_str})", inline=True)
-                embed.add_field(name="Fees Source", value=gmgn_fees_source, inline=True)
-                embed.add_field(name="Twitter", value=f"[🐦 Twitter]({gmgn_x_url})" if gmgn_x_url else "N/A", inline=True)
                 embed.set_footer(text=f"Requested by {message.author.display_name}")
                 print(f"[DEBUG] Sending embed with {len(pools[:10])} pools to channel {message.channel.id}")
                 sys.stdout.flush()
