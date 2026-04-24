@@ -2,10 +2,10 @@
 # This ensures both Python and Node.js are available
 # Note: npm is included with nodejs_20, no need to specify separately
 # Using virtual environment to avoid externally-managed-environment error
-# python3Full includes pip and venv module
+# Use python3 (python3Full removed in current nixpkgs channel)
 
 [phases.setup]
-nixPkgs = ["python3Full", "nodejs_20"]
+nixPkgs = ["python3", "nodejs_20"]
 
 [phases.install]
 cmds = [

@@ -64,7 +64,7 @@ Setelah deploy, check logs untuk:
 #### Build fails dengan error "undefined variable 'npm'":
 1. **PENTING**: Jangan include `npm` sebagai package terpisah di `nixpacks.toml`
 2. `npm` sudah termasuk dengan `nodejs_20`, tidak perlu ditambahkan
-3. Pastikan `nixpacks.toml` hanya berisi: `nixPkgs = ["python3Full", "nodejs_20"]`
+3. Pastikan `nixpacks.toml` hanya berisi: `nixPkgs = ["python3", "nodejs_20"]`
 4. Jangan gunakan: `nixPkgs = ["python39", "nodejs_20", "npm"]` ❌
 
 #### Build fails dengan error "No module named pip" di phase build:
@@ -85,11 +85,11 @@ Setelah deploy, check logs untuk:
 
 #### Build fails dengan error "pip: command not found" atau "No module named pip":
 1. **PENTING**: Python di Nix tidak include pip secara default
-2. **Solusi yang bekerja**: Gunakan `python3Full` yang sudah include pip dan venv
+2. **Solusi yang bekerja**: Gunakan `python3` + virtual environment (venv)
 3. Gunakan virtual environment untuk avoid "externally-managed-environment" error:
    ```toml
    [phases.setup]
-   nixPkgs = ["python3Full", "nodejs_20"]
+   nixPkgs = ["python3", "nodejs_20"]
    
    [phases.install]
    cmds = [
@@ -107,7 +107,7 @@ Setelah deploy, check logs untuk:
 1. **PENTING**: Python di Nix adalah immutable dan tidak bisa diinstall package langsung
 2. **Solusi**: Gunakan virtual environment (venv) untuk install packages
 3. Atau gunakan flag `--break-system-packages` (hanya untuk containerized environments)
-4. **Recommended**: Gunakan `python3Full` dengan virtual environment seperti di atas ✅
+4. **Recommended**: Gunakan `python3` dengan virtual environment seperti di atas ✅
 
 #### Build fails lainnya:
 1. Pastikan `package.json` ada di root directory
@@ -119,7 +119,7 @@ Setelah deploy, check logs untuk:
 Jika Railway tidak auto-install, pastikan konfigurasi di `nixpacks.toml` sudah benar:
 ```toml
 [phases.setup]
-nixPkgs = ["python3Full", "nodejs_20"]
+nixPkgs = ["python3", "nodejs_20"]
 
 [phases.install]
 cmds = [
