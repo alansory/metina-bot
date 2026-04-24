@@ -5,7 +5,7 @@
 # Use python3 (python3Full removed in current nixpkgs channel)
 
 [phases.setup]
-nixPkgs = ["python3", "nodejs_20"]
+nixPkgs = ["python3", "nodejs_20", "gcc"]
 
 [phases.install]
 cmds = [

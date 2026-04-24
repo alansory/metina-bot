@@ -64,7 +64,7 @@ Setelah deploy, check logs untuk:
 #### Build fails dengan error "undefined variable 'npm'":
 1. **PENTING**: Jangan include `npm` sebagai package terpisah di `nixpacks.toml`
 2. `npm` sudah termasuk dengan `nodejs_20`, tidak perlu ditambahkan
-3. Pastikan `nixpacks.toml` hanya berisi: `nixPkgs = ["python3", "nodejs_20"]`
+3. Pastikan `nixpacks.toml` berisi minimal: `nixPkgs = ["python3", "nodejs_20", "gcc"]`
 4. Jangan gunakan: `nixPkgs = ["python39", "nodejs_20", "npm"]` ❌
 
 #### Build fails dengan error "No module named pip" di phase build:
@@ -89,7 +89,7 @@ Setelah deploy, check logs untuk:
 3. Gunakan virtual environment untuk avoid "externally-managed-environment" error:
    ```toml
    [phases.setup]
-   nixPkgs = ["python3", "nodejs_20"]
+   nixPkgs = ["python3", "nodejs_20", "gcc"]
    
    [phases.install]
    cmds = [
@@ -119,7 +119,7 @@ Setelah deploy, check logs untuk:
 Jika Railway tidak auto-install, pastikan konfigurasi di `nixpacks.toml` sudah benar:
 ```toml
 [phases.setup]
-nixPkgs = ["python3", "nodejs_20"]
+nixPkgs = ["python3", "nodejs_20", "gcc"]
 
 [phases.install]
 cmds = [
