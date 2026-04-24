@@ -38,6 +38,14 @@ Railway akan otomatis install Meteora SDK saat deploy jika konfigurasi berikut a
    python3 main.py
    ```
 
+4. **Auto-install `gmgn-cli` saat deploy:**
+   - Sudah diset di `nixpacks.toml` phase `install`:
+   ```toml
+   "npm install -g gmgn-cli",
+   "gmgn-cli --version"
+   ```
+   - Jadi setiap deploy baru, binary `gmgn-cli` akan tersedia otomatis di runtime image.
+
 ### Verifikasi:
 
 Setelah deploy, check logs untuk:
@@ -132,6 +140,18 @@ Pastikan set di Railway:
 - `LP_WALLET_PRIVATE_KEY` (optional)
 - `HELIUS_RPC_URL` atau `RPC_URL`
 - `SOLANA_MCP_URL` (optional)
+- `USE_GMGN_FOR_FEES=true` (agar fallback Jupiter -> GMGN aktif)
+- `GMGN_API_KEY` (wajib kalau `USE_GMGN_FOR_FEES=true`)
+
+Contoh minimum env untuk bot call + GMGN fallback:
+```env
+DISCORD_BOT_TOKEN=your_discord_bot_token
+HELIUS_API_KEY=your_helius_key
+JUPITER_API_KEY=your_jupiter_key
+BOT_CALL_CHANNEL_ID=1443433566058053662
+USE_GMGN_FOR_FEES=true
+GMGN_API_KEY=your_gmgn_api_key
+```
 
 ### Notes:
 

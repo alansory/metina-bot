@@ -9,6 +9,7 @@ import sys
 import json
 import time
 import random
+import shutil
 from collections import deque
 from discord import app_commands
 from discord.ui import Button, View
@@ -186,6 +187,11 @@ BOT_CALL_STATE_FILE = "bot_call_state.json"  # File untuk simpan state token yan
 bot_call_notified_tokens: Dict[str, str] = {}  # {token_address: date_notified (YYYY-MM-DD)}
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "efd896ec-30ed-4c89-a990-32b315e13d20")  # Jupiter API key
 USE_METEORA_FOR_FEES = os.getenv("USE_METEORA_FOR_FEES", "false").lower() == "true"  # Use Meteora for volume/fees data
+USE_GMGN_FOR_FEES = os.getenv("USE_GMGN_FOR_FEES", "true").lower() == "true"  # Use GMGN CLI as fee fallback
+GMGN_API_KEY = os.getenv("GMGN_API_KEY", "gmgn_2c1187debd8629631134237d3b60828f").strip()  # Required by gmgn-cli at runtime
+
+if USE_GMGN_FOR_FEES and not GMGN_API_KEY:
+    print("[WARN] USE_GMGN_FOR_FEES=true tapi GMGN_API_KEY belum diset. Fallback GMGN akan otomatis skip.")
 
 # ============================================================================
 # --- FITUR BARU: AUTO TRADING BOT (FULL AUTO) ---
@@ -2855,6 +2861,199 @@ async def _fetch_jupiter_token_fees_via_search(token_address: str, token_symbol:
     return None
 
 
+def _extract_first_float(value) -> Optional[float]:
+    """Best effort numeric parser for mixed GMGN response shapes."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, list):
+        for item in value:
+            parsed = _extract_first_float(item)
+            if parsed is not None:
+                return parsed
+        return None
+    if isinstance(value, dict):
+        for k in ("value", "usd", "volume", "vol", "v", "amount"):
+            if k in value:
+                parsed = _extract_first_float(value.get(k))
+                if parsed is not None:
+                    return parsed
+        return None
+    return None
+
+
+def _extract_gmgn_volume_24h_from_payload(payload: dict) -> Optional[float]:
+    """Try multiple candidate keys because gmgn-cli response can differ by version."""
+    if not isinstance(payload, dict):
+        return None
+    candidates = [
+        payload.get("volume_24h"),
+        payload.get("volume24h"),
+        payload.get("volume"),
+        payload.get("vol"),
+        (payload.get("data") or {}).get("volume_24h") if isinstance(payload.get("data"), dict) else None,
+        (payload.get("data") or {}).get("volume24h") if isinstance(payload.get("data"), dict) else None,
+    ]
+    for item in candidates:
+        parsed = _extract_first_float(item)
+        if parsed is not None and parsed > 0:
+            return parsed
+    return None
+
+
+def _extract_gmgn_pool_fee_ratio_percent(payload: dict) -> Optional[float]:
+    """Read fee_ratio in percent as documented by GMGN (e.g. 0.1 means 0.1%)."""
+    if not isinstance(payload, dict):
+        return None
+    possible_roots = [payload]
+    if isinstance(payload.get("data"), dict):
+        possible_roots.append(payload["data"])
+    if isinstance(payload.get("pool"), dict):
+        possible_roots.append(payload["pool"])
+    for root in possible_roots:
+        ratio = _extract_first_float(root.get("fee_ratio"))
+        if ratio is not None and ratio >= 0:
+            return ratio
+    return None
+
+
+async def _run_gmgn_cli_json(args: List[str], token_symbol: str, timeout_sec: int = 12) -> Optional[dict]:
+    """Run gmgn-cli and parse JSON output safely. Returns None on any failure."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "gmgn-cli",
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_sec)
+    except Exception as e:
+        print(f"[DEBUG] GMGN CLI execution failed for {token_symbol}: {e}")
+        return None
+
+    if process.returncode != 0:
+        err_text = (stderr.decode("utf-8", errors="ignore") or "").strip()
+        print(f"[DEBUG] GMGN CLI returned {process.returncode} for {token_symbol}: {err_text[:200]}")
+        return None
+
+    out_text = (stdout.decode("utf-8", errors="ignore") or "").strip()
+    if not out_text:
+        return None
+
+    for line in reversed(out_text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+async def fetch_gmgn_volume_and_fees(token_address: str, token_symbol: str) -> Tuple[Optional[float], Optional[float]]:
+    """Best-effort GMGN fallback: fees_usd = volume_24h_usd * (pool_fee_ratio_percent/100)."""
+    if not USE_GMGN_FOR_FEES:
+        return None, None
+    if not shutil.which("gmgn-cli"):
+        return None, None
+
+    # `token pool` gives fee_ratio, while volume is fetched from kline route.
+    pool_payload = await _run_gmgn_cli_json(
+        ["token", "pool", "--chain", "sol", "--address", token_address, "--raw"],
+        token_symbol,
+        timeout_sec=14,
+    )
+    fee_ratio_percent = _extract_gmgn_pool_fee_ratio_percent(pool_payload or {})
+    if fee_ratio_percent is None or fee_ratio_percent <= 0:
+        return None, None
+
+    market_payload = await _run_gmgn_cli_json(
+        ["market", "kline", "--chain", "sol", "--address", token_address, "--resolution", "1d", "--raw"],
+        token_symbol,
+        timeout_sec=14,
+    )
+    volume_24h_usd = _extract_gmgn_volume_24h_from_payload(market_payload or {})
+    if volume_24h_usd is None or volume_24h_usd <= 0:
+        return None, None
+
+    fees_24h_usd = volume_24h_usd * (fee_ratio_percent / 100.0)
+    if fees_24h_usd <= 0:
+        return None, None
+    return volume_24h_usd, fees_24h_usd
+
+
+async def fetch_gmgn_token_fees_sol(token_address: str, token_symbol: str) -> Optional[float]:
+    """Prefer direct fee fields from GMGN token info payload (total_fee/trade_fee)."""
+    if not USE_GMGN_FOR_FEES:
+        return None
+    if not shutil.which("gmgn-cli"):
+        return None
+
+    payload = await _run_gmgn_cli_json(
+        ["token", "info", "--chain", "sol", "--address", token_address, "--raw"],
+        token_symbol,
+        timeout_sec=14,
+    )
+    if not isinstance(payload, dict):
+        return None
+
+    # Observed in real response: total_fee / trade_fee at top-level.
+    for key in ("total_fee", "trade_fee", "totalFees", "fees", "fees_24h"):
+        parsed = _extract_first_float(payload.get(key))
+        if parsed is not None and parsed > 0:
+            print(f"[DEBUG]   {token_symbol}: GMGN token info {key}={parsed:.4f} (treated as SOL)")
+            return parsed
+    return None
+
+
+def _normalize_x_url(raw_value: Optional[str]) -> Optional[str]:
+    """Normalize GMGN twitter field into a full X URL."""
+    if not raw_value or not isinstance(raw_value, str):
+        return None
+    value = raw_value.strip()
+    if not value:
+        return None
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    if value.startswith("@"):
+        value = value[1:]
+    return f"https://x.com/{value}"
+
+
+async def fetch_gmgn_token_x_url(token_address: str, token_symbol: str) -> Optional[str]:
+    """Fetch token X/Twitter URL from GMGN token info response."""
+    if not USE_GMGN_FOR_FEES:
+        return None
+    if not shutil.which("gmgn-cli"):
+        return None
+
+    payload = await _run_gmgn_cli_json(
+        ["token", "info", "--chain", "sol", "--address", token_address, "--raw"],
+        token_symbol,
+        timeout_sec=14,
+    )
+    if not isinstance(payload, dict):
+        return None
+
+    link_obj = payload.get("link") if isinstance(payload.get("link"), dict) else {}
+    twitter_url = _normalize_x_url(link_obj.get("twitter"))
+    if twitter_url:
+        return twitter_url
+    twitter_username_url = _normalize_x_url(link_obj.get("twitter_username"))
+    if twitter_username_url:
+        return twitter_username_url
+    return None
+
+
 # --- HELPER: FETCH NEW TOKENS FROM JUPITER API ---
 async def fetch_new_tokens() -> List[Dict[str, object]]:
     """Fetch new tokens from Jupiter API that meet criteria."""
@@ -2987,6 +3186,8 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                     fee_origin = "calculated"
                     jupiter_fees_sol = None
                     meteora_fees = None
+                    gmgn_fees = None
+                    gmgn_fees_sol = None
 
                     for fee_pass in range(2):
                         if fee_pass == 1:
@@ -3018,6 +3219,37 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                             fee_origin = "jupiter"
                             print(
                                 f"[DEBUG]   {token_symbol}: Using fees from Jupiter API (pass {fee_pass + 1}/2): "
+                                f"{total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)"
+                            )
+                            break
+                        if USE_GMGN_FOR_FEES:
+                            if gmgn_fees_sol is None:
+                                gmgn_fees_sol = await fetch_gmgn_token_fees_sol(token_address, token_symbol)
+                            if gmgn_fees_sol is not None and gmgn_fees_sol > 0:
+                                total_fees_sol = gmgn_fees_sol
+                                total_fees_usd = (
+                                    total_fees_sol * sol_price_usd if sol_price_usd and total_fees_sol > 0 else 0
+                                )
+                                fee_origin = "gmgn"
+                                print(
+                                    f"[DEBUG]   {token_symbol}: Using fees from GMGN token info (pass {fee_pass + 1}/2): "
+                                    f"{total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)"
+                                )
+                                break
+
+                            gmgn_volume_try, gmgn_fees_try = await fetch_gmgn_volume_and_fees(token_address, token_symbol)
+                            if gmgn_fees_try is not None and gmgn_fees_try > 0:
+                                gmgn_fees = gmgn_fees_try
+                            if gmgn_volume_try and gmgn_volume_try > (volume_24h_usd or 0):
+                                volume_24h_usd = gmgn_volume_try
+                        if gmgn_fees and gmgn_fees > 0:
+                            total_fees_usd = gmgn_fees
+                            total_fees_sol = (
+                                total_fees_usd / sol_price_usd if sol_price_usd and total_fees_usd > 0 else 0
+                            )
+                            fee_origin = "gmgn"
+                            print(
+                                f"[DEBUG]   {token_symbol}: Using fees from GMGN fallback (pass {fee_pass + 1}/2): "
                                 f"{total_fees_sol:.4f} SOL (${total_fees_usd:,.2f} USD)"
                             )
                             break
@@ -3058,6 +3290,8 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                         if fee_origin == "jupiter"
                         else "Meteora"
                         if fee_origin == "meteora"
+                        else "GMGN"
+                        if fee_origin == "gmgn"
                         else "Calculated (0.3% of volume)"
                     )
                     print(f"    - Fees: {total_fees_sol:.2f} SOL (${total_fees_usd:,.2f} USD) from {fees_source} (min: {BOT_CALL_MIN_FEES_SOL} SOL) -> {'✅' if fees_ok else '❌'}")
@@ -3137,6 +3371,7 @@ async def fetch_new_tokens() -> List[Dict[str, object]]:
                         "market_cap": market_cap,
                         "total_fees_sol": total_fees_sol,
                         "total_fees_usd": total_fees_usd,
+                        "fees_source": fees_source,
                         "price_usd": price_usd,
                         "liquidity_usd": liquidity_usd,
                         "volume_24h": volume_24h_usd,
@@ -3179,6 +3414,7 @@ async def send_bot_call_notification(token_data: Dict[str, object]):
         market_cap = token_data.get("market_cap")
         total_fees_sol = token_data.get("total_fees_sol", 0)
         total_fees_usd = token_data.get("total_fees_usd", 0)
+        fees_source = token_data.get("fees_source", "Unknown")
         price_usd = token_data.get("price_usd")
         liquidity_usd = token_data.get("liquidity_usd")
         volume_24h = token_data.get("volume_24h")
@@ -3199,6 +3435,12 @@ async def send_bot_call_notification(token_data: Dict[str, object]):
                 meteora_pool_address = top_pool.get('address')
         except Exception as e:
             print(f"[DEBUG] Could not fetch Meteora pools for link: {e}")
+
+        gmgn_x_url = None
+        try:
+            gmgn_x_url = await fetch_gmgn_token_x_url(token_address, token_symbol)
+        except Exception as e:
+            print(f"[DEBUG] Could not fetch GMGN X link: {e}")
         
         embed = discord.Embed(
             title=f"🆕 New Token Detected: {token_symbol}",
@@ -3209,6 +3451,7 @@ async def send_bot_call_notification(token_data: Dict[str, object]):
         
         embed.add_field(name="Market Cap", value=market_cap_str, inline=True)
         embed.add_field(name="Total Fees (24h)", value=f"{fees_sol_str}\n({fees_usd_str})", inline=True)
+        embed.add_field(name="Fees Source", value=fees_source, inline=True)
         
         if price_usd:
             embed.add_field(name="Price", value=f"${price_usd:.8f}", inline=True)
@@ -3234,6 +3477,8 @@ async def send_bot_call_notification(token_data: Dict[str, object]):
             f"[🪐 Jupiter](https://jup.ag/tokens/{token_address})\n"
             f"[📊 GMGN](https://gmgn.ai/sol/token/{token_address})"
         )
+        if gmgn_x_url:
+            links_value += f"\n[𝕏 X]({gmgn_x_url})"
         
         # Add Meteora link with pool address if available, otherwise use search
         if meteora_pool_address:
@@ -7128,18 +7373,47 @@ async def on_message(message: discord.Message):
                     link = f"https://app.meteora.ag/dlmm/{p['address']}"
                     desc += f"{i}. [{p['pair']}]({link}) {p['bin']} - LQ: {p['liq']}\n"
 
+                # Optional GMGN enrich data for CA check embed
+                gmgn_fees_sol = None
+                gmgn_fees_usd = 0.0
+                gmgn_fees_source = "N/A"
+                gmgn_x_url = None
+                try:
+                    gmgn_fees_sol = await fetch_gmgn_token_fees_sol(content, content[:8])
+                    if gmgn_fees_sol is not None and gmgn_fees_sol > 0:
+                        gmgn_fees_source = "GMGN"
+                        sol_price_usd = await fetch_sol_price()
+                        gmgn_fees_usd = gmgn_fees_sol * sol_price_usd if sol_price_usd else 0.0
+                except Exception as e:
+                    print(f"[DEBUG] Could not fetch GMGN fees for CA check: {e}")
+                try:
+                    gmgn_x_url = await fetch_gmgn_token_x_url(content, content[:8])
+                except Exception as e:
+                    print(f"[DEBUG] Could not fetch GMGN X link for CA check: {e}")
+
                 print(f"[DEBUG] Creating embed object...")
                 embed = discord.Embed(title="Meteora Pool Bot", description=desc, color=0x00ff00)
+                if gmgn_fees_sol is not None and gmgn_fees_sol > 0:
+                    fees_usd_str = _format_usd(gmgn_fees_usd) if gmgn_fees_usd > 0 else "N/A"
+                    embed.add_field(
+                        name="Total Fees (24h)",
+                        value=f"{gmgn_fees_sol:.2f} SOL\n({fees_usd_str})",
+                        inline=True,
+                    )
+                    embed.add_field(name="Fees Source", value=gmgn_fees_source, inline=True)
+                if gmgn_x_url:
+                    embed.add_field(name="𝕏 X", value=f"[Open X]({gmgn_x_url})", inline=True)
                 embed.set_footer(text=f"Requested by {message.author.display_name}")
                 print(f"[DEBUG] Sending embed with {len(pools[:10])} pools to channel {message.channel.id}")
                 sys.stdout.flush()
                 try:
                     # Create button view for creating thread
                     class CreateLPThreadView(discord.ui.View):
-                        def __init__(self, token_address: str, pools_data: List[Dict]):
+                        def __init__(self, token_address: str, pools_data: List[Dict], token_x_url: Optional[str] = None):
                             super().__init__(timeout=None)
                             self.token_address = token_address
                             self.pools_data = pools_data
+                            self.token_x_url = token_x_url
                         
                         @discord.ui.button(label="📝 Create LP Call Thread", style=discord.ButtonStyle.primary)
                         async def create_thread_button(self, button_interaction: discord.Interaction, button: discord.ui.Button):
@@ -7199,6 +7473,7 @@ async def on_message(message: discord.Message):
                                         f"[🔍 Solscan](https://solscan.io/token/{self.token_address})\n"
                                         f"[🪐 Jupiter](https://jup.ag/tokens/{self.token_address})\n"
                                         f"[📊 GMGN](https://gmgn.ai/sol/token/{self.token_address})"
+                                        + (f"\n[𝕏 X]({self.token_x_url})" if self.token_x_url else "")
                                     ),
                                     inline=False
                                 )
@@ -7258,7 +7533,7 @@ async def on_message(message: discord.Message):
                                 import traceback
                                 traceback.print_exc()
                     
-                    view = CreateLPThreadView(content, pools)
+                    view = CreateLPThreadView(content, pools, gmgn_x_url)
                     await message.channel.send(embed=embed, view=view)
                     print(f"[DEBUG] ✅ Embed sent successfully!")
                     sys.stdout.flush()

@@ -12,7 +12,9 @@ cmds = [
     "python3 -m venv /app/venv",
     ". /app/venv/bin/activate && pip install --upgrade pip",
     ". /app/venv/bin/activate && pip install -r requirements.txt",
-    "npm install"
+    "npm install",
+    "npm install -g gmgn-cli",
+    "gmgn-cli --version"
 ]
 
 [phases.build]
