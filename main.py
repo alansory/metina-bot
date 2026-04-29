@@ -37,6 +37,8 @@ METEORA_DAMM_V2_DATAPI = os.getenv("METEORA_DAMM_V2_DATAPI", "https://damm-v2.da
 # Token safety: Metina (Rugcheck) — optional hosted JSON API; else Rugcheck directly
 METINA_PUBLIC_URL = os.getenv("METINA_PUBLIC_URL", "https://metina.id").strip().rstrip("/")
 METINA_TOKEN_SAFETY_API = os.getenv("METINA_TOKEN_SAFETY_API", "").strip()
+# Optional: RugCheck Shield API (same scores as rugcheck.xyz UI). Falls back to public api if Shield errors.
+RUGCHECK_API_KEY = os.getenv("RUGCHECK_API_KEY", "").strip()
 
 # --- DISCORD INTENTS ---
 intents = discord.Intents.default()
@@ -621,6 +623,40 @@ def _build_metina_token_safety_from_rugcheck(data: Dict, mint: str) -> Dict:
         "tokenPropertiesAnalysis": props_analysis,
     }
 
+async def _fetch_rugcheck_report_json(token_address: str) -> Optional[Dict]:
+    """Try Shield (if RUGCHECK_API_KEY set), then public api.rugcheck.xyz."""
+    global http_session
+    attempts: List[Tuple[str, str, bool]] = []
+    if RUGCHECK_API_KEY:
+        attempts.append(("shield", "https://shield.rugcheck.xyz", True))
+    attempts.append(("public", "https://api.rugcheck.xyz", False))
+
+    last_err: Optional[str] = None
+    for name, base, use_key in attempts:
+        url = f"{base}/v1/tokens/{token_address}/report"
+        headers: Dict[str, str] = {"Accept": "application/json"}
+        if use_key and RUGCHECK_API_KEY:
+            headers["x-api-key"] = RUGCHECK_API_KEY
+        try:
+            async with http_session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                body = await response.text()
+                last_err = f"{name} HTTP {response.status}"
+                print(f"[TOKEN_SAFETY] Rugcheck {name} failed ({response.status}): {body[:200]}")
+        except asyncio.TimeoutError:
+            last_err = f"{name} timeout"
+            print(f"[TOKEN_SAFETY] Rugcheck {name} timeout for {token_address}")
+        except Exception as e:
+            last_err = f"{name}: {e}"
+            print(f"[TOKEN_SAFETY] Rugcheck {name} error: {e}")
+
+    if last_err:
+        print(f"[TOKEN_SAFETY] All Rugcheck attempts failed ({last_err})")
+    return None
+
 async def fetch_token_safety(token_address: str) -> Optional[Dict]:
     """Metina-compatible token safety: optional METINA_TOKEN_SAFETY_API, else Rugcheck (same as metina.id)."""
     global http_session
@@ -636,15 +672,10 @@ async def fetch_token_safety(token_address: str) -> Optional[Dict]:
                 print(f"[TOKEN_SAFETY] Metina API returned status {response.status}")
                 return None
 
-        rc_url = f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report"
-        async with http_session.get(
-            rc_url, headers={"Accept": "application/json"}, timeout=aiohttp.ClientTimeout(total=20)
-        ) as response:
-            if response.status != 200:
-                print(f"[TOKEN_SAFETY] Rugcheck returned status {response.status}")
-                return None
-            data = await response.json()
-            return _build_metina_token_safety_from_rugcheck(data, token_address)
+        data = await _fetch_rugcheck_report_json(token_address)
+        if not data:
+            return None
+        return _build_metina_token_safety_from_rugcheck(data, token_address)
     except asyncio.TimeoutError:
         print(f"[TOKEN_SAFETY] Timeout fetching safety data for {token_address}")
         return None
