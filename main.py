@@ -517,13 +517,26 @@ def _rugcheck_score_to_embed_level(score: float) -> str:
     s = float(score) if score is not None else 0.0
     if s <= 25:
         return "OK"
-    if s <= 800:
+    if s <= 60:
         return "RISKY"
     return "CRITICAL"
 
 def _build_metina_token_safety_from_rugcheck(data: Dict, mint: str) -> Dict:
     """Shape compatible with Metina /api/metina/token-safety (Rugcheck-backed)."""
-    score = float(data.get("score") or 0)
+    raw_score = float(data.get("score") or 0)
+    normalized_score = data.get("score_normalised")
+    try:
+        normalized_score = float(normalized_score) if normalized_score is not None else None
+    except (ValueError, TypeError):
+        normalized_score = None
+    # Prefer normalized 0-100 score shown by RugCheck UI when available.
+    # Some payloads only expose raw score (can be >100), so clamp for embed safety.
+    score_source = "score_normalised"
+    if normalized_score is not None:
+        score = normalized_score
+    else:
+        score_source = "score_raw_fallback"
+        score = max(0.0, min(100.0, raw_score))
     top_holders = data.get("topHolders") or []
     th = top_holders[0] if top_holders else None
     top10_pct = sum(float(h.get("pct") or 0) for h in top_holders[:10])
@@ -580,6 +593,11 @@ def _build_metina_token_safety_from_rugcheck(data: Dict, mint: str) -> Dict:
             ]
         )
 
+    print(
+        f"[TOKEN_SAFETY] Rugcheck score source={score_source} "
+        f"raw={raw_score} normalized={normalized_score} final={score} mint={mint_key}"
+    )
+
     return {
         "_source": "metina",
         "mint": mint_key,
@@ -588,6 +606,7 @@ def _build_metina_token_safety_from_rugcheck(data: Dict, mint: str) -> Dict:
         "tokenSymbol": token_symbol,
         "platform": platform,
         "rugcheckScore": int(round(score)),
+        "rugcheckRawScore": int(round(raw_score)),
         "rugCheckRisks": rugcheck_risks,
         "criticalRisks": critical_risks,
         "warnings": warnings,
@@ -705,7 +724,12 @@ def create_token_safety_embeds(safety_data: Dict, token_address: str = None) -> 
         color=color
     )
     
-    rugcheck_score = safety_data.get("rugcheckScore", 0)
+    rugcheck_score_raw = safety_data.get("rugcheckScore", 0)
+    try:
+        rugcheck_score = int(round(float(rugcheck_score_raw)))
+    except (ValueError, TypeError):
+        rugcheck_score = 0
+    rugcheck_score = max(0, min(100, rugcheck_score))
     
     # Format safety level - simple and clean like the image
     safety_display = f"**{safety_level}** - Score: {rugcheck_score}/100"
